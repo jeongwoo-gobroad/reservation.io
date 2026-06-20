@@ -24,7 +24,7 @@ substitutions:
   _ADMIN_PASSWORD_SECRET: reservation-admin-password
   _KAKAO_REST_API_KEY_SECRET: reservation-kakao-rest-api-key
   _KAKAO_CLIENT_SECRET_SECRET: reservation-kakao-client-secret
-  _RUN_MIGRATIONS: "false"
+  _RUN_MIGRATIONS: "true"
 
 steps:
   - name: gcr.io/cloud-builders/docker
