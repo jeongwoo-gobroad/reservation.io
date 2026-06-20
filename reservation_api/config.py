@@ -49,6 +49,8 @@ class Settings:
     otp_manual_hash_algorithm: str
     otp_manual_code_length: int
     admin_login_fail_limit: int
+    anti_macro_duration: int
+    anti_macro_retention_seconds: int
     cors_allowed_origins: list[str]
     display_timezone_label: str
     app_timezone: str
@@ -79,6 +81,8 @@ def load_settings() -> Settings:
         otp_manual_hash_algorithm=os.getenv("OTP_MANUAL_HASH_ALGORITHM", "sha1"),
         otp_manual_code_length=max(6, _int_env("OTP_MANUAL_CODE_LENGTH", 12)),
         admin_login_fail_limit=max(1, _int_env("ADMIN_LOGIN_FAIL_LIMIT", 5)),
+        anti_macro_duration=max(1, _int_env("ANTI_MACRO_DURATION", 10)),
+        anti_macro_retention_seconds=max(60, _int_env("ANTI_MACRO_RETENTION_SECONDS", 3600)),
         cors_allowed_origins=_csv_env("CORS_ALLOWED_ORIGINS", "http://localhost:3000"),
         display_timezone_label=os.getenv("DISPLAY_TIMEZONE_LABEL", "Seoul, KR"),
         app_timezone=os.getenv("APP_TIMEZONE", "Asia/Seoul"),

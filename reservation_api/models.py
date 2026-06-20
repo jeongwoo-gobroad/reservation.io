@@ -187,11 +187,35 @@ class IpBan(Base):
     __tablename__ = "ip_bans"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    ip_address: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    ip_address: Mapped[str] = mapped_column(String(64), index=True)
+    actor_key: Mapped[str] = mapped_column(String(96), default="", index=True)
+    user_uuid: Mapped[str] = mapped_column(String(36), default="")
+    nickname: Mapped[str] = mapped_column(String(64), default="")
     reason: Mapped[str] = mapped_column(String(240), default="")
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
+
+    __table_args__ = (UniqueConstraint("ip_address", "actor_key", name="uq_ip_bans_ip_actor"),)
+
+
+class IpRateLimit(Base):
+    __tablename__ = "ip_rate_limits"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ip_address: Mapped[str] = mapped_column(String(64), index=True)
+    actor_key: Mapped[str] = mapped_column(String(96), index=True)
+    user_uuid: Mapped[str] = mapped_column(String(36), default="")
+    nickname: Mapped[str] = mapped_column(String(64), default="")
+    route_key: Mapped[str] = mapped_column(String(180), index=True)
+    window_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    request_count: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
+
+    __table_args__ = (
+        UniqueConstraint("ip_address", "actor_key", "route_key", "window_started_at", name="uq_ip_rate_limits_scope_window"),
+        Index("ix_ip_rate_limits_window_started_at", "window_started_at"),
+    )
 
 
 class AdminLoginAttempt(Base):

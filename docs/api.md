@@ -7,6 +7,10 @@
 - 인증 방식: `Authorization: Bearer <access_token>`
 - 날짜 판단 기준: `APP_TIMEZONE`, 기본 `Asia/Seoul`
 - 화면 하단 시간 기준 문구: `DISPLAY_TIMEZONE_LABEL`
+- 반복 요청 차단 기준: 로그인된 같은 사용자, 같은 IP, 같은 API, 같은 1초 창에서 `ANTI_MACRO_DURATION`회 이상
+- 반복 요청 창 보존 시간: `ANTI_MACRO_RETENTION_SECONDS`, 기본 3600초
+- 자동 반복 요청 차단 범위: 같은 IP 전체가 아니라 `IP + 로그인 사용자`
+- 수동 IP 차단 또는 관리자 로그인 실패 차단 범위: 전체 IP
 
 ## 공통 응답
 

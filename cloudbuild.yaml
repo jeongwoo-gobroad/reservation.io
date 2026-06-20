@@ -2,7 +2,7 @@ substitutions:
   _REGION: asia-northeast3
   _SERVICE_NAME: reservation-api
   _ARTIFACT_REPOSITORY: reservation-api
-  _CLOUD_SQL_CONNECTION_NAME: reservation-io:us-central1:reservation-db
+  _CLOUD_SQL_CONNECTION_NAME: reservation-io:asia-northeast3:reservation-db-lite
   _RUNTIME_SERVICE_ACCOUNT: reservation-api-runner@reservation-io.iam.gserviceaccount.com
   _IS_DEV_MODE: "false"
   _APP_ENV: production
@@ -15,6 +15,8 @@ substitutions:
   _OTP_MANUAL_HASH_ALGORITHM: sha1
   _OTP_MANUAL_CODE_LENGTH: "12"
   _ADMIN_LOGIN_FAIL_LIMIT: "5"
+  _ANTI_MACRO_DURATION: "15"
+  _ANTI_MACRO_RETENTION_SECONDS: "600"
   _MESSAGE_BUS_BACKEND: none
   _VISIT_EVENT_TOPIC: ""
   _DATABASE_URL_SECRET: reservation-database-url
@@ -50,21 +52,6 @@ steps:
     entrypoint: gcloud
     args:
       - run
-      - deploy
-      - ${_SERVICE_NAME}
-      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPOSITORY}/${_SERVICE_NAME}:$SHORT_SHA
-      - --region=${_REGION}
-      - --platform=managed
-      - --allow-unauthenticated
-      - --service-account=${_RUNTIME_SERVICE_ACCOUNT}
-      - --set-cloudsql-instances=${_CLOUD_SQL_CONNECTION_NAME}
-      - --set-env-vars=^|^IS_DEV_MODE=${_IS_DEV_MODE}|APP_ENV=${_APP_ENV}|APP_TIMEZONE=${_APP_TIMEZONE}|DISPLAY_TIMEZONE_LABEL=${_DISPLAY_TIMEZONE_LABEL}|OTP_TIMEOUT_SECOND=${_OTP_TIMEOUT_SECOND}|OTP_DELTA=${_OTP_DELTA}|OTP_QR_HASH_ALGORITHM=${_OTP_QR_HASH_ALGORITHM}|OTP_MANUAL_HASH_ALGORITHM=${_OTP_MANUAL_HASH_ALGORITHM}|OTP_MANUAL_CODE_LENGTH=${_OTP_MANUAL_CODE_LENGTH}|ADMIN_LOGIN_FAIL_LIMIT=${_ADMIN_LOGIN_FAIL_LIMIT}|MESSAGE_BUS_BACKEND=${_MESSAGE_BUS_BACKEND}|VISIT_EVENT_TOPIC=${_VISIT_EVENT_TOPIC}|CORS_ALLOWED_ORIGINS=${_CORS_ALLOWED_ORIGINS}
-      - --set-secrets=DATABASE_URL=${_DATABASE_URL_SECRET}:latest,SECRET_KEY=${_SECRET_KEY_SECRET}:latest,OTP_SECRET_KEY=${_OTP_SECRET_KEY_SECRET}:latest,ADMIN_ID=${_ADMIN_ID_SECRET}:latest,ADMIN_PASSWORD=${_ADMIN_PASSWORD_SECRET}:latest,KAKAO_REST_API_KEY=${_KAKAO_REST_API_KEY_SECRET}:latest,KAKAO_CLIENT_SECRET=${_KAKAO_CLIENT_SECRET_SECRET}:latest
-
-  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
-    entrypoint: gcloud
-    args:
-      - run
       - jobs
       - deploy
       - ${_SERVICE_NAME}-migrate
@@ -87,6 +74,21 @@ steps:
         else
           echo "Skipping migration execution. Set _RUN_MIGRATIONS=true when you are ready."
         fi
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE_NAME}
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPOSITORY}/${_SERVICE_NAME}:$SHORT_SHA
+      - --region=${_REGION}
+      - --platform=managed
+      - --allow-unauthenticated
+      - --service-account=${_RUNTIME_SERVICE_ACCOUNT}
+      - --set-cloudsql-instances=${_CLOUD_SQL_CONNECTION_NAME}
+      - --set-env-vars=^|^IS_DEV_MODE=${_IS_DEV_MODE}|APP_ENV=${_APP_ENV}|APP_TIMEZONE=${_APP_TIMEZONE}|DISPLAY_TIMEZONE_LABEL=${_DISPLAY_TIMEZONE_LABEL}|OTP_TIMEOUT_SECOND=${_OTP_TIMEOUT_SECOND}|OTP_DELTA=${_OTP_DELTA}|OTP_QR_HASH_ALGORITHM=${_OTP_QR_HASH_ALGORITHM}|OTP_MANUAL_HASH_ALGORITHM=${_OTP_MANUAL_HASH_ALGORITHM}|OTP_MANUAL_CODE_LENGTH=${_OTP_MANUAL_CODE_LENGTH}|ADMIN_LOGIN_FAIL_LIMIT=${_ADMIN_LOGIN_FAIL_LIMIT}|ANTI_MACRO_DURATION=${_ANTI_MACRO_DURATION}|ANTI_MACRO_RETENTION_SECONDS=${_ANTI_MACRO_RETENTION_SECONDS}|MESSAGE_BUS_BACKEND=${_MESSAGE_BUS_BACKEND}|VISIT_EVENT_TOPIC=${_VISIT_EVENT_TOPIC}|CORS_ALLOWED_ORIGINS=${_CORS_ALLOWED_ORIGINS}
+      - --set-secrets=DATABASE_URL=${_DATABASE_URL_SECRET}:latest,SECRET_KEY=${_SECRET_KEY_SECRET}:latest,OTP_SECRET_KEY=${_OTP_SECRET_KEY_SECRET}:latest,ADMIN_ID=${_ADMIN_ID_SECRET}:latest,ADMIN_PASSWORD=${_ADMIN_PASSWORD_SECRET}:latest,KAKAO_REST_API_KEY=${_KAKAO_REST_API_KEY_SECRET}:latest,KAKAO_CLIENT_SECRET=${_KAKAO_CLIENT_SECRET_SECRET}:latest
 
 images:
   - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPOSITORY}/${_SERVICE_NAME}:$SHORT_SHA

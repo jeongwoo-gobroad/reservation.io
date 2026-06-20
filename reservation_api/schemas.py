@@ -122,6 +122,11 @@ class ReservationCreate(BaseModel):
     items: list[ReservationItemIn]
 
 
+class ReservationPatch(BaseModel):
+    quantity: int | None = Field(None, ge=1)
+    time_slot_uuid: str | None = None
+
+
 class ReservationOut(BaseModel):
     uuid: str
     sale_date: date
@@ -200,6 +205,9 @@ class DayCloseOut(BaseModel):
 
 class IpBanIn(BaseModel):
     ip_address: str = Field(..., examples=["203.0.113.10"])
+    actor_key: str = ""
+    user_uuid: str = ""
+    nickname: str = ""
     reason: str = Field("관리자 로그인 실패 누적")
     active: bool = True
 
@@ -237,3 +245,13 @@ class SettingUpdate(BaseModel):
 class SettingOut(BaseModel):
     key: str
     value: str
+
+
+class BlockStatusOut(BaseModel):
+    blocked: bool
+    ip_address: str
+    actor_key: str
+    user_uuid: str
+    nickname: str
+    reason: str = ""
+    message_markdown: str = ""

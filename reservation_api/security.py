@@ -60,9 +60,20 @@ def client_ip(request: Request) -> str:
 
 def reject_banned_ip(request: Request, db: Session) -> None:
     ip_address = client_ip(request)
-    ban = db.scalar(select(IpBan).where(IpBan.ip_address == ip_address, IpBan.active.is_(True)))
+    ban = db.scalar(select(IpBan).where(IpBan.ip_address == ip_address, IpBan.actor_key == "", IpBan.active.is_(True)))
     if ban:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="banned ip")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "ip_banned",
+                "message": "blocked ip",
+                "ip_address": ban.ip_address,
+                "actor_key": getattr(ban, "actor_key", "") or "",
+                "user_uuid": getattr(ban, "user_uuid", "") or "",
+                "nickname": getattr(ban, "nickname", "") or "",
+                "reason": ban.reason,
+            },
+        )
 
 
 def bearer_token(authorization: str | None = Header(None)) -> str:
@@ -85,10 +96,12 @@ def require_admin(
 
 
 def require_user(
+    request: Request,
     token: str = Depends(bearer_token),
     settings: Settings = Depends(load_settings),
     db: Session = Depends(get_db),
 ) -> User:
+    reject_banned_ip(request, db)
     payload = verify_access_token(token, settings)
     if payload.get("scope") != "user":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="user token required")

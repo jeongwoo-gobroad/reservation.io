@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import json
+import re
 import urllib.parse
 import urllib.request
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
@@ -16,6 +18,7 @@ from sqlalchemy.orm import Session, selectinload
 from . import models
 from .config import Settings, load_settings
 from .database import Base, engine, get_db
+from .database import SessionLocal
 from .message_bus import get_message_bus
 from .otp import manual_code, qr_hash, remaining_seconds, verify_token
 from .schemas import (
@@ -23,6 +26,7 @@ from .schemas import (
     AdminScanRequest,
     BannedUserIn,
     BannedUserOut,
+    BlockStatusOut,
     CompleteVisitRequest,
     CompletedVisitOut,
     DayCloseOut,
@@ -34,6 +38,7 @@ from .schemas import (
     PendingDayCloseOut,
     ReservationCreate,
     ReservationOut,
+    ReservationPatch,
     ScheduleSetCreate,
     ScheduleSetOut,
     ScheduleSetPatch,
@@ -45,12 +50,18 @@ from .schemas import (
     VisitScanOut,
     VisitTokenOut,
 )
-from .security import client_ip, create_access_token, reject_banned_ip, require_admin, require_user
+from .security import bearer_token, client_ip, create_access_token, reject_banned_ip, require_admin, require_user, verify_access_token
 from .timezone import local_today
 
 
 settings = load_settings()
 message_bus = get_message_bus(settings)
+BLOCKED_USER_MESSAGE_KEY = "blocked_user_message_markdown"
+DEFAULT_BLOCKED_USER_MESSAGE = "현재 접속이 제한되어 있습니다. 매장 관리자에게 문의해 주세요."
+RATE_LIMIT_SKIP_PATHS = {"/health", "/users/me/block-status", f"/settings/{BLOCKED_USER_MESSAGE_KEY}"}
+RATE_LIMIT_SKIP_PREFIXES = ("/swagger", "/redoc", "/openapi.json")
+IP_BAN_READABLE_PATHS = {"/health", "/auth/kakao/exchange", "/users/me/block-status", f"/settings/{BLOCKED_USER_MESSAGE_KEY}"}
+UUID_PATH_PART = re.compile(r"/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?=/|$)")
 
 app = FastAPI(
     title="Pokecard Reservation API",
@@ -71,6 +82,25 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def anti_macro_and_ip_ban_middleware(request: Request, call_next):
+    if request.method == "OPTIONS" or should_skip_rate_limit(request.url.path):
+        return await call_next(request)
+    db = SessionLocal()
+    try:
+        ip_address = client_ip(request)
+        actor_key, _, _ = rate_limit_actor(db, request)
+        ban = active_ip_ban(db, ip_address, actor_key)
+        if ban and request.url.path not in IP_BAN_READABLE_PATHS:
+            return ip_ban_response(request, db, ban)
+        triggered_ban = apply_anti_macro_limit(db, request, ip_address)
+        if triggered_ban:
+            return ip_ban_response(request, db, triggered_ban)
+    finally:
+        db.close()
+    return await call_next(request)
 
 
 @app.on_event("startup")
@@ -97,7 +127,7 @@ def admin_login(request: Request, body: AdminLoginRequest, db: Session = Depends
         attempt.failure_count = (attempt.failure_count or 0) + 1
         attempt.last_failed_at = models.now_utc()
         if attempt.failure_count >= settings.admin_login_fail_limit:
-            ban = db.scalar(select(models.IpBan).where(models.IpBan.ip_address == ip_address))
+            ban = db.scalar(select(models.IpBan).where(models.IpBan.ip_address == ip_address, models.IpBan.actor_key == ""))
             if not ban:
                 db.add(models.IpBan(ip_address=ip_address, reason="관리자 로그인 5회 이상 실패", active=True))
             else:
@@ -165,6 +195,31 @@ def kakao_exchange(body: KakaoCodeExchangeRequest, db: Session = Depends(get_db)
 @app.get("/users/me", response_model=UserOut, tags=["users"])
 def get_me(user: models.User = Depends(require_user)) -> models.User:
     return user
+
+
+@app.get("/users/me/block-status", response_model=BlockStatusOut, tags=["users"])
+def get_my_block_status(
+    request: Request,
+    token: str = Depends(bearer_token),
+    db: Session = Depends(get_db),
+) -> BlockStatusOut:
+    payload = verify_access_token(token, settings)
+    if payload.get("scope") != "user":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="user token required")
+    user = db.scalar(select(models.User).where(models.User.uuid == payload.get("sub")))
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="user not found")
+    actor_key = f"user:{user.uuid}"
+    ban = active_ip_ban(db, client_ip(request), actor_key)
+    return BlockStatusOut(
+        blocked=bool(ban),
+        ip_address=client_ip(request),
+        actor_key=actor_key,
+        user_uuid=user.uuid,
+        nickname=user.nickname,
+        reason=ban.reason if ban else "",
+        message_markdown=setting_value(db, BLOCKED_USER_MESSAGE_KEY, DEFAULT_BLOCKED_USER_MESSAGE) if ban else "",
+    )
 
 
 @app.patch("/users/me/nickname", response_model=UserOut, tags=["users"])
@@ -333,6 +388,7 @@ def create_reservation(
         select(models.ScheduleSet)
         .where(models.ScheduleSet.uuid.in_(selected_set_uuids))
         .options(selectinload(models.ScheduleSet.time_slots))
+        .order_by(models.ScheduleSet.id)
         .with_for_update()
     ).all()
     sets_by_uuid = {row.uuid: row for row in sets}
@@ -345,15 +401,32 @@ def create_reservation(
         raise HTTPException(status_code=400, detail=f"[{blocked}] 일정은 같은 날짜의 다른 일정과 함께 예약할 수 없습니다.")
     if is_user_banned(db, user):
         raise HTTPException(status_code=403, detail="예약이 제한된 사용자입니다.")
+    already_consumed = db.scalars(
+        select(models.Reservation.schedule_set_id).where(
+            models.Reservation.user_id == user.id,
+            models.Reservation.schedule_set_id.in_([row.id for row in sets]),
+            models.Reservation.status.in_(["visited", "no_show"]),
+        )
+    ).all()
+    if already_consumed:
+        consumed_ids = set(already_consumed)
+        blocked_titles = ", ".join(row.title for row in sets if row.id in consumed_ids)
+        raise HTTPException(status_code=400, detail=f"[{blocked_titles}] 일정은 이미 수령 완료 또는 노쇼 처리되어 다시 예약할 수 없습니다.")
     if active_reservations_for_date(db, user.id, body.sale_date):
         raise HTTPException(status_code=400, detail="이미 같은 날짜의 예약이 있습니다. 변경은 기존 예약 취소 후 다시 진행해 주세요.")
 
     products = db.scalars(
-        select(models.SaleProduct).where(models.SaleProduct.uuid.in_({item.product_uuid for item in body.items})).with_for_update()
+        select(models.SaleProduct)
+        .where(models.SaleProduct.uuid.in_({item.product_uuid for item in body.items}))
+        .order_by(models.SaleProduct.id)
+        .with_for_update()
     ).all()
     products_by_uuid = {row.uuid: row for row in products}
     time_slots = db.scalars(
-        select(models.TimeSlot).where(models.TimeSlot.uuid.in_({item.time_slot_uuid for item in body.items if item.time_slot_uuid})).with_for_update()
+        select(models.TimeSlot)
+        .where(models.TimeSlot.uuid.in_({item.time_slot_uuid for item in body.items if item.time_slot_uuid}))
+        .order_by(models.TimeSlot.id)
+        .with_for_update()
     ).all()
     time_slots_by_uuid = {row.uuid: row for row in time_slots}
 
@@ -407,14 +480,131 @@ def my_reservations(user: models.User = Depends(require_user), db: Session = Dep
     return [reservation_out(row) for row in rows]
 
 
-@app.delete("/reservations/{reservation_uuid}", status_code=204, tags=["reservations"])
-def cancel_reservation(reservation_uuid: str, user: models.User = Depends(require_user), db: Session = Depends(get_db)) -> None:
+@app.patch("/reservations/{reservation_uuid}", response_model=ReservationOut, tags=["reservations"])
+def update_reservation(
+    reservation_uuid: str,
+    body: ReservationPatch,
+    user: models.User = Depends(require_user),
+    db: Session = Depends(get_db),
+) -> ReservationOut:
+    locked_user = db.scalar(select(models.User).where(models.User.id == user.id).with_for_update())
+    if not locked_user:
+        raise HTTPException(status_code=401, detail="user not found")
     reservation = db.scalar(
-        select(models.Reservation).where(
+        select(models.Reservation)
+        .where(
             models.Reservation.uuid == reservation_uuid,
             models.Reservation.user_id == user.id,
             models.Reservation.status == "reserved",
         )
+        .options(
+            selectinload(models.Reservation.product).selectinload(models.SaleProduct.group),
+            selectinload(models.Reservation.schedule_set),
+            selectinload(models.Reservation.time_slot),
+        )
+        .with_for_update()
+    )
+    if not reservation:
+        raise HTTPException(status_code=404, detail="수정 가능한 예약을 찾을 수 없습니다.")
+
+    schedule_set = db.scalar(
+        select(models.ScheduleSet)
+        .where(models.ScheduleSet.id == reservation.schedule_set_id)
+        .options(selectinload(models.ScheduleSet.time_slots))
+        .with_for_update()
+    )
+    product = db.scalar(
+        select(models.SaleProduct)
+        .where(models.SaleProduct.id == reservation.product_id)
+        .options(selectinload(models.SaleProduct.group))
+        .with_for_update()
+    )
+    if not product or not schedule_set:
+        raise HTTPException(status_code=404, detail="예약 일정 또는 상품을 찾을 수 없습니다.")
+
+    new_quantity = body.quantity if body.quantity is not None else reservation.quantity
+    if new_quantity > product.per_user_limit:
+        raise HTTPException(status_code=400, detail=f"[{product.name}] 상품은 1인당 {product.per_user_limit}개까지 예약할 수 있습니다.")
+
+    existing_group_total = int(
+        db.scalar(
+            select(func.coalesce(func.sum(models.Reservation.quantity), 0))
+            .join(models.SaleProduct, models.SaleProduct.id == models.Reservation.product_id)
+            .where(
+                models.Reservation.user_id == user.id,
+                models.Reservation.schedule_set_id == reservation.schedule_set_id,
+                models.Reservation.status == "reserved",
+                models.Reservation.id != reservation.id,
+                models.SaleProduct.group_id == product.group_id,
+            )
+        )
+        or 0
+    )
+    if existing_group_total + new_quantity > product.group.purchase_limit:
+        raise HTTPException(status_code=400, detail=f"[{product.group.name}] 그룹은 총 {product.group.purchase_limit}개까지 선택 가능합니다.")
+
+    if product.stock_quantity is not None:
+        next_reserved_quantity = reserved_quantity(db, product.id) - reservation.quantity + new_quantity
+        if next_reserved_quantity > product.stock_quantity:
+            raise HTTPException(status_code=400, detail=f"[{product.name}] 상품의 남은 재고가 부족합니다.")
+
+    provided_fields = getattr(body, "model_fields_set", getattr(body, "__fields_set__", set()))
+    next_time_slot_id = reservation.time_slot_id
+    if schedule_set.has_time_slots:
+        if "time_slot_uuid" in provided_fields:
+            if not body.time_slot_uuid:
+                raise HTTPException(status_code=400, detail="방문 시간을 선택해 주세요.")
+            next_slot = db.scalar(
+                select(models.TimeSlot)
+                .where(models.TimeSlot.uuid == body.time_slot_uuid, models.TimeSlot.schedule_set_id == schedule_set.id)
+                .with_for_update()
+            )
+            if not next_slot:
+                raise HTTPException(status_code=400, detail="유효하지 않은 방문 시간입니다.")
+            if next_slot.id != reservation.time_slot_id and next_slot.capacity is not None:
+                already_counted = bool(
+                    db.scalar(
+                        select(models.Reservation.id).where(
+                            models.Reservation.time_slot_id == next_slot.id,
+                            models.Reservation.user_id == user.id,
+                            models.Reservation.status == "reserved",
+                            models.Reservation.id != reservation.id,
+                        )
+                    )
+                )
+                if not already_counted and reserved_customers_for_slot(db, next_slot.id) >= next_slot.capacity:
+                    raise HTTPException(status_code=400, detail=f"[{next_slot.label}] 방문 시간은 예약이 모두 찼습니다.")
+            next_time_slot_id = next_slot.id
+    elif "time_slot_uuid" in provided_fields and body.time_slot_uuid:
+        raise HTTPException(status_code=400, detail="이 일정은 방문 시간을 나누어 받지 않습니다.")
+
+    reservation.quantity = new_quantity
+    reservation.time_slot_id = next_time_slot_id
+    reservation.updated_at = models.now_utc()
+    db.commit()
+    updated = db.scalar(
+        select(models.Reservation)
+        .where(models.Reservation.id == reservation.id)
+        .options(selectinload(models.Reservation.product), selectinload(models.Reservation.schedule_set), selectinload(models.Reservation.time_slot))
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="수정된 예약을 찾을 수 없습니다.")
+    return reservation_out(updated)
+
+
+@app.delete("/reservations/{reservation_uuid}", status_code=204, tags=["reservations"])
+def cancel_reservation(reservation_uuid: str, user: models.User = Depends(require_user), db: Session = Depends(get_db)) -> None:
+    locked_user = db.scalar(select(models.User).where(models.User.id == user.id).with_for_update())
+    if not locked_user:
+        raise HTTPException(status_code=401, detail="user not found")
+    reservation = db.scalar(
+        select(models.Reservation)
+        .where(
+            models.Reservation.uuid == reservation_uuid,
+            models.Reservation.user_id == user.id,
+            models.Reservation.status == "reserved",
+        )
+        .with_for_update()
     )
     if not reservation:
         raise HTTPException(status_code=404, detail="예약을 찾을 수 없습니다.")
@@ -649,10 +839,13 @@ def list_ip_bans(_: Annotated[dict, Depends(require_admin)], db: Session = Depen
 
 @app.post("/admin/ip-bans", response_model=IpBanOut, status_code=201, tags=["admin-ip-bans"])
 def add_ip_ban(body: IpBanIn, _: Annotated[dict, Depends(require_admin)], db: Session = Depends(get_db)) -> models.IpBan:
-    ban = db.scalar(select(models.IpBan).where(models.IpBan.ip_address == body.ip_address))
+    ban = db.scalar(select(models.IpBan).where(models.IpBan.ip_address == body.ip_address, models.IpBan.actor_key == body.actor_key))
     if not ban:
-        ban = models.IpBan(ip_address=body.ip_address)
+        ban = models.IpBan(ip_address=body.ip_address, actor_key=body.actor_key)
         db.add(ban)
+    ban.actor_key = body.actor_key
+    ban.user_uuid = body.user_uuid
+    ban.nickname = body.nickname
     ban.reason = body.reason
     ban.active = body.active
     db.commit()
@@ -661,8 +854,16 @@ def add_ip_ban(body: IpBanIn, _: Annotated[dict, Depends(require_admin)], db: Se
 
 
 @app.delete("/admin/ip-bans/{ip_address}", status_code=204, tags=["admin-ip-bans"])
-def delete_ip_ban(ip_address: str, _: Annotated[dict, Depends(require_admin)], db: Session = Depends(get_db)) -> None:
-    db.execute(delete(models.IpBan).where(models.IpBan.ip_address == ip_address))
+def delete_ip_ban(
+    ip_address: str,
+    _: Annotated[dict, Depends(require_admin)],
+    db: Session = Depends(get_db),
+    actor_key: str | None = None,
+) -> None:
+    stmt = delete(models.IpBan).where(models.IpBan.ip_address == ip_address)
+    if actor_key is not None:
+        stmt = stmt.where(models.IpBan.actor_key == actor_key)
+    db.execute(stmt)
     db.commit()
 
 
@@ -690,7 +891,7 @@ def put_setting(
 
 @app.get("/settings/{key}", response_model=SettingOut, tags=["settings"])
 def public_setting(key: str, db: Session = Depends(get_db)) -> SettingOut:
-    public_keys = {"disclaimer_markdown", "reservation_agreement_markdown"}
+    public_keys = {"disclaimer_markdown", "reservation_agreement_markdown", BLOCKED_USER_MESSAGE_KEY}
     if key not in public_keys:
         raise HTTPException(status_code=404, detail="public setting not found")
     return SettingOut(key=key, value=setting_value(db, key, ""))
@@ -886,3 +1087,145 @@ def is_user_banned(db: Session, user: models.User) -> bool:
 def setting_value(db: Session, key: str, default: str) -> str:
     setting = db.get(models.AppSetting, key)
     return setting.value if setting else default
+
+
+def should_skip_rate_limit(path: str) -> bool:
+    return path in RATE_LIMIT_SKIP_PATHS or any(path.startswith(prefix) for prefix in RATE_LIMIT_SKIP_PREFIXES)
+
+
+def active_ip_ban(db: Session, ip_address: str, actor_key: str = "") -> models.IpBan | None:
+    actor_candidates = [""] if not actor_key else ["", actor_key]
+    return db.scalar(
+        select(models.IpBan)
+        .where(
+            models.IpBan.ip_address == ip_address,
+            models.IpBan.actor_key.in_(actor_candidates),
+            models.IpBan.active.is_(True),
+        )
+        .order_by(models.IpBan.actor_key.desc())
+    )
+
+
+def ip_ban_response(request: Request, db: Session, ban: models.IpBan) -> JSONResponse:
+    message = setting_value(db, BLOCKED_USER_MESSAGE_KEY, DEFAULT_BLOCKED_USER_MESSAGE)
+    payload = {
+        "detail": {
+            "code": "ip_banned",
+            "message": message,
+            "ip_address": ban.ip_address,
+            "actor_key": ban.actor_key,
+            "user_uuid": ban.user_uuid,
+            "nickname": ban.nickname,
+            "reason": ban.reason,
+        }
+    }
+    response = JSONResponse(status_code=status.HTTP_403_FORBIDDEN, content=payload)
+    origin = request.headers.get("origin")
+    if origin and origin in settings.cors_allowed_origins:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Vary"] = "Origin"
+    return response
+
+
+def rate_limit_actor(db: Session, request: Request) -> tuple[str, str, str]:
+    authorization = request.headers.get("authorization", "")
+    if not authorization.lower().startswith("bearer "):
+        return "", "", ""
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        payload = verify_access_token(token, settings)
+    except HTTPException:
+        return "", "", ""
+    if payload.get("scope") == "admin":
+        return "admin", "", "관리자"
+    if payload.get("scope") != "user":
+        return "", "", ""
+    user = db.scalar(select(models.User).where(models.User.uuid == payload.get("sub")))
+    if not user:
+        return "", "", ""
+    return f"user:{user.uuid}", user.uuid, user.nickname
+
+
+def rate_limit_route_key(request: Request) -> str:
+    normalized_path = UUID_PATH_PART.sub("/{uuid}", request.url.path)
+    return f"{request.method.upper()} {normalized_path}"
+
+
+def rate_limit_window_start(now: datetime) -> datetime:
+    return now.replace(microsecond=0)
+
+
+def apply_anti_macro_limit(db: Session, request: Request, ip_address: str) -> models.IpBan | None:
+    now = models.now_utc()
+    actor_key, user_uuid, nickname = rate_limit_actor(db, request)
+    if not actor_key:
+        return None
+
+    route_key = rate_limit_route_key(request)
+    window_started_at = rate_limit_window_start(now)
+    cleanup_before = now - timedelta(seconds=settings.anti_macro_retention_seconds)
+    db.execute(delete(models.IpRateLimit).where(models.IpRateLimit.window_started_at < cleanup_before))
+
+    row = db.scalar(
+        select(models.IpRateLimit)
+        .where(
+            models.IpRateLimit.ip_address == ip_address,
+            models.IpRateLimit.actor_key == actor_key,
+            models.IpRateLimit.route_key == route_key,
+            models.IpRateLimit.window_started_at == window_started_at,
+        )
+        .with_for_update()
+    )
+    if not row:
+        row = models.IpRateLimit(
+            ip_address=ip_address,
+            actor_key=actor_key,
+            user_uuid=user_uuid,
+            nickname=nickname,
+            route_key=route_key,
+            window_started_at=window_started_at,
+            request_count=0,
+        )
+        db.add(row)
+        try:
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            row = db.scalar(
+                select(models.IpRateLimit)
+                .where(
+                    models.IpRateLimit.ip_address == ip_address,
+                    models.IpRateLimit.actor_key == actor_key,
+                    models.IpRateLimit.route_key == route_key,
+                    models.IpRateLimit.window_started_at == window_started_at,
+                )
+                .with_for_update()
+            )
+            if not row:
+                raise
+
+    row.request_count += 1
+    row.updated_at = now
+    row.user_uuid = user_uuid or row.user_uuid
+    row.nickname = nickname or row.nickname
+    if row.request_count < settings.anti_macro_duration:
+        db.commit()
+        return None
+
+    reason = f"초당 동일 API 요청 {row.request_count}회 감지(차단 기준 {settings.anti_macro_duration}회, API {route_key})"
+    ban = db.scalar(
+        select(models.IpBan)
+        .where(models.IpBan.ip_address == ip_address, models.IpBan.actor_key == actor_key)
+        .with_for_update()
+    )
+    if not ban:
+        ban = models.IpBan(ip_address=ip_address, actor_key=actor_key)
+        db.add(ban)
+    ban.active = True
+    ban.user_uuid = row.user_uuid
+    ban.nickname = row.nickname
+    ban.reason = reason
+    db.commit()
+    db.refresh(ban)
+    return ban
