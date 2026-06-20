@@ -2,7 +2,7 @@ substitutions:
   _REGION: asia-northeast3
   _SERVICE_NAME: reservation-api
   _ARTIFACT_REPOSITORY: reservation-api
-  _CLOUD_SQL_CONNECTION_NAME: reservation-io:asia-northeast3:reservation-db
+  _CLOUD_SQL_CONNECTION_NAME: reservation-io:us-central1:reservation-db
   _RUNTIME_SERVICE_ACCOUNT: reservation-api-runner@reservation-io.iam.gserviceaccount.com
   _IS_DEV_MODE: "false"
   _APP_ENV: production
