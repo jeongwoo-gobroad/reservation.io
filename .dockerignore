@@ -1,0 +1,17 @@
+.git
+.venv
+__pycache__
+*.pyc
+.env
+.env.*
+.local
+data
+.smoke-data
+.smoke-data-stock
+.browser-data
+tests
+server.out.log
+server.err.log
+*.db
+*.sqlite
+*.log
