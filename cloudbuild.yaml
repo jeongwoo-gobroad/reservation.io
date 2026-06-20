@@ -8,7 +8,7 @@ substitutions:
   _APP_ENV: production
   _APP_TIMEZONE: Asia/Seoul
   _DISPLAY_TIMEZONE_LABEL: Seoul, KR
-  _CORS_ALLOWED_ORIGINS: https://your-vercel-domain.vercel.app
+  _CORS_ALLOWED_ORIGINS: https://reservation-io.vercel.app
   _OTP_TIMEOUT_SECOND: "30"
   _OTP_DELTA: "1"
   _OTP_QR_HASH_ALGORITHM: md5
