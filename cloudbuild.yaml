@@ -92,6 +92,7 @@ images:
   - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPOSITORY}/${_SERVICE_NAME}:$SHORT_SHA
   - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPOSITORY}/${_SERVICE_NAME}:latest
 
+serviceAccount: 'projects/reservation-io/serviceAccounts/${_RUNTIME_SERVICE_ACCOUNT}'
+
 options:
-  serviceAccount: 'projects/reservation-io/serviceAccounts/${_RUNTIME_SERVICE_ACCOUNT}'
   logging: CLOUD_LOGGING_ONLY
