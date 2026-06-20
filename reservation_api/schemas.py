@@ -143,7 +143,34 @@ class ReservationOut(BaseModel):
 
 class VisitTokenOut(BaseModel):
     reservation_uuid: str
+    sale_date: date
+    schedule_set_uuid: str
+    schedule_title: str
+    product_name: str
+    quantity: int
+    time_slot_label: str
     qr_hash: str = Field(..., description="기본값은 HMAC-MD5 hex")
+    expires_in_seconds: int
+    hash_window: str = Field(..., examples=["t-1,t,t+1"])
+
+
+class VisitTokenListOut(BaseModel):
+    tokens: list[VisitTokenOut]
+    message: str = ""
+
+
+class ManualVisitCodeRequest(BaseModel):
+    reservation_uuid: str
+
+
+class VisitManualCodeOut(BaseModel):
+    reservation_uuid: str
+    sale_date: date
+    schedule_set_uuid: str
+    schedule_title: str
+    product_name: str
+    quantity: int
+    time_slot_label: str
     manual_code: str = Field(..., description="기본값은 HMAC-SHA1 앞 12자리")
     expires_in_seconds: int
     hash_window: str = Field(..., examples=["t-1,t,t+1"])
@@ -151,7 +178,7 @@ class VisitTokenOut(BaseModel):
 
 class AdminScanRequest(BaseModel):
     token: str = Field(..., examples=["b6fc4c620b67d95f953a5c1c1230aaab"])
-    token_type: Literal["auto", "qr", "manual"] = "auto"
+    token_type: Literal["auto", "qr", "manual"] = "qr"
 
 
 class VisitScanOut(BaseModel):

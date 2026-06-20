@@ -49,8 +49,14 @@ class Settings:
     otp_manual_hash_algorithm: str
     otp_manual_code_length: int
     admin_login_fail_limit: int
+    db_based_ip_ban: bool
     anti_macro_duration: int
     anti_macro_retention_seconds: int
+    otp_manual_code_registry_backend: str
+    otp_manual_code_collection: str
+    otp_manual_code_max_attempts: int
+    firestore_project_id: str
+    firestore_database: str
     cors_allowed_origins: list[str]
     display_timezone_label: str
     app_timezone: str
@@ -61,10 +67,11 @@ class Settings:
 @lru_cache(maxsize=1)
 def load_settings() -> Settings:
     secret_key = os.getenv("SECRET_KEY", "dev-secret-change-me")
+    environment = os.getenv("APP_ENV", "local")
     return Settings(
         project_id=os.getenv("GCP_PROJECT", os.getenv("GOOGLE_CLOUD_PROJECT", "reservation-io")),
         service_name=os.getenv("SERVICE_NAME", "reservation-api"),
-        environment=os.getenv("APP_ENV", "local"),
+        environment=environment,
         database_url=os.getenv("DATABASE_URL", "sqlite:///./.local/reservation_api.db"),
         is_dev_mode=_bool_env("IS_DEV_MODE", False),
         secret_key=secret_key,
@@ -81,8 +88,17 @@ def load_settings() -> Settings:
         otp_manual_hash_algorithm=os.getenv("OTP_MANUAL_HASH_ALGORITHM", "sha1"),
         otp_manual_code_length=max(6, _int_env("OTP_MANUAL_CODE_LENGTH", 12)),
         admin_login_fail_limit=max(1, _int_env("ADMIN_LOGIN_FAIL_LIMIT", 5)),
+        db_based_ip_ban=_bool_env("DB_BASED_IP_BAN", False),
         anti_macro_duration=max(1, _int_env("ANTI_MACRO_DURATION", 10)),
         anti_macro_retention_seconds=max(60, _int_env("ANTI_MACRO_RETENTION_SECONDS", 3600)),
+        otp_manual_code_registry_backend=os.getenv(
+            "OTP_MANUAL_CODE_REGISTRY_BACKEND",
+            "memory" if environment == "local" else "firestore",
+        ),
+        otp_manual_code_collection=os.getenv("OTP_MANUAL_CODE_COLLECTION", "manual_otp_codes"),
+        otp_manual_code_max_attempts=max(1, _int_env("OTP_MANUAL_CODE_MAX_ATTEMPTS", 16)),
+        firestore_project_id=os.getenv("FIRESTORE_PROJECT_ID", os.getenv("GCP_PROJECT", os.getenv("GOOGLE_CLOUD_PROJECT", ""))),
+        firestore_database=os.getenv("FIRESTORE_DATABASE", "(default)"),
         cors_allowed_origins=_csv_env("CORS_ALLOWED_ORIGINS", "http://localhost:3000"),
         display_timezone_label=os.getenv("DISPLAY_TIMEZONE_LABEL", "Seoul, KR"),
         app_timezone=os.getenv("APP_TIMEZONE", "Asia/Seoul"),

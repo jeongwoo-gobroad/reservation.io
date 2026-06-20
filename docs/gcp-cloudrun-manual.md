@@ -239,7 +239,13 @@ Cloud Run 서비스 화면에서 확인할 곳:
 - `OTP_QR_HASH_ALGORITHM`
 - `OTP_MANUAL_HASH_ALGORITHM`
 - `OTP_MANUAL_CODE_LENGTH`
+- `OTP_MANUAL_CODE_REGISTRY_BACKEND`
+- `OTP_MANUAL_CODE_COLLECTION`
+- `OTP_MANUAL_CODE_MAX_ATTEMPTS`
+- `FIRESTORE_PROJECT_ID`
+- `FIRESTORE_DATABASE`
 - `ADMIN_LOGIN_FAIL_LIMIT`
+- `DB_BASED_IP_BAN`
 - `MESSAGE_BUS_BACKEND`
 - `VISIT_EVENT_TOPIC`
 - `CORS_ALLOWED_ORIGINS`
@@ -262,9 +268,15 @@ Secret 환경변수:
 - Secret 값 변경 후에는 Cloud Run 새 revision 배포 필요
 - 운영에서는 Swagger가 열리지 않아야 함
 - 영업 마감은 자동 처리되지 않음
+
+## 10. Firestore 수동 코드 저장소
+
+방문 확인 수동 코드 충돌 방지는 Firestore를 사용합니다. QR 화면 표시만으로는 Firestore를 사용하지 않고, 현장에서 수동 코드 발급이 필요할 때만 Firestore를 읽고 씁니다. Google Cloud Console에서 Firestore 데이터베이스를 만들고, Cloud Run 실행 계정에 `Cloud Datastore User` 권한을 부여해야 합니다.
+
+관리 화면 기준 상세 절차는 [rev_002.md](./rev_002.md)의 `GCP Web GUI 설정 가이드`를 따르십시오.
 - 어드민 메인 화면에서 미마감 지난 영업일을 확인하고 수동 마감해야 함
 
-## 10. 자주 생기는 문제
+## 11. 자주 생기는 문제
 
 ### `/health`가 열리지 않습니다
 

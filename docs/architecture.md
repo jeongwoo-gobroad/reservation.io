@@ -57,6 +57,8 @@ flowchart LR
 - QR 값은 `{유저 UUID}:{예약 UUID}:{counter}`를 HMAC 해시한 값입니다.
 - 기본 QR 해시는 `md5`, 수동 코드는 `sha1` 앞 12자리입니다.
 - `OTP_QR_HASH_ALGORITHM`, `OTP_MANUAL_HASH_ALGORITHM`, `OTP_MANUAL_CODE_LENGTH`로 교체 가능합니다.
+- QR 표시는 stateless 계산만 사용합니다.
+- 수동 코드는 QR 인식이 어려워 별도 발급 API를 호출할 때만 Firestore에 충돌 방지 매핑을 저장합니다.
 - 메시지 버스는 현재 `none` 기본값입니다.
 - 향후 `MESSAGE_BUS_BACKEND=pubsub`, `VISIT_EVENT_TOPIC=projects/.../topics/...`를 주면 방문 완료/하루 종료 이벤트를 Pub/Sub로 흘릴 수 있습니다.
 
@@ -87,11 +89,20 @@ sequenceDiagram
     participant Admin as 어드민
     participant Api as Cloud Run API
     participant Db as Cloud SQL
+    participant Fs as Firestore
 
     User->>Api: GET /users/me/visit-tokens
-    Api-->>User: 예약별 QR 해시, 수동 코드
+    Api-->>User: 예약별 QR 해시
+    opt QR 인식 불가
+        User->>Api: POST /users/me/visit-manual-code
+        Api->>Fs: 수동 코드 충돌 확인 및 매핑 저장
+        Api-->>User: 수동 코드
+    end
     Admin->>Api: POST /admin/visits/scan
-    Api->>Db: 오늘 예약 중 해시 대조
+    opt 수동 코드 입력
+        Api->>Fs: 발급된 수동 코드인지 확인
+    end
+    Api->>Db: 오늘 예약 중 QR 해시 또는 예약 정보 대조
     Api-->>Admin: 예약 상세
     Admin->>Api: POST /admin/visits/complete
     Api->>Db: 방문 완료 기록

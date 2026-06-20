@@ -11,6 +11,7 @@
 - 반복 요청 창 보존 시간: `ANTI_MACRO_RETENTION_SECONDS`, 기본 3600초
 - 자동 반복 요청 차단 범위: 같은 IP 전체가 아니라 `IP + 로그인 사용자`
 - 수동 IP 차단 또는 관리자 로그인 실패 차단 범위: 전체 IP
+- 운영 기본값: `DB_BASED_IP_BAN=false`이므로 과도한 요청 차단은 Vercel KV 쪽에서 먼저 처리합니다.
 
 ## 공통 응답
 
@@ -264,20 +265,28 @@
 
 ### GET `/users/me/visit-tokens`
 
-오늘 예약에 대한 방문 확인 QR 해시와 수동 코드를 발급합니다.
+오늘 예약에 대한 방문 확인 QR 해시를 발급합니다. 이 API는 Firestore를 읽거나 쓰지 않습니다. 미래 일자의 예약은 예약 당일이 아니므로 토큰을 발급하지 않습니다.
 
 응답:
 
 ```json
-[
-  {
-    "reservation_uuid": "reservation-uuid",
-    "qr_hash": "b6fc4c620b67d95f953a5c1c1230aaab",
-    "manual_code": "a1b2c3d4e5f6",
-    "expires_in_seconds": 18,
-    "hash_window": "t-1,t,t+1"
-  }
-]
+{
+  "tokens": [
+    {
+      "reservation_uuid": "reservation-uuid",
+      "sale_date": "2026-07-01",
+      "schedule_set_uuid": "schedule-set-uuid",
+      "schedule_title": "1차 예약",
+      "product_name": "상품명",
+      "quantity": 1,
+      "time_slot_label": "14:00",
+      "qr_hash": "b6fc4c620b67d95f953a5c1c1230aaab",
+      "expires_in_seconds": 18,
+      "hash_window": "t-1,t,t+1"
+    }
+  ],
+  "message": ""
+}
 ```
 
 알고리즘:
@@ -285,8 +294,43 @@
 - material: `{user_uuid}:{reservation_uuid}:{counter}`
 - counter: `floor(server_epoch_seconds / OTP_TIMEOUT_SECOND)`
 - QR 기본값: `HMAC-MD5(material, OTP_SECRET_KEY)`
-- 수동 코드 기본값: `HMAC-SHA1(material, OTP_SECRET_KEY)` 앞 12자리
 - 허용 오차: `OTP_DELTA=1`이면 `t-1`, `t`, `t+1`
+
+### POST `/users/me/visit-manual-code`
+
+QR 인식이 어렵거나 카메라 스캔이 실패해서 현장에서 수동 입력이 필요할 때만 수동 코드를 발급합니다. 이 API는 Firestore에서 수동 코드 충돌 여부를 확인하고, 유효한 코드 매핑을 저장합니다.
+
+요청:
+
+```json
+{
+  "reservation_uuid": "reservation-uuid"
+}
+```
+
+응답:
+
+```json
+{
+  "reservation_uuid": "reservation-uuid",
+  "sale_date": "2026-07-01",
+  "schedule_set_uuid": "schedule-set-uuid",
+  "schedule_title": "1차 예약",
+  "product_name": "상품명",
+  "quantity": 1,
+  "time_slot_label": "14:00",
+  "manual_code": "a1b2c3d4e5f6",
+  "expires_in_seconds": 18,
+  "hash_window": "t-1,t,t+1"
+}
+```
+
+수동 코드 알고리즘:
+
+- 기본값: `HMAC-SHA1(material, OTP_SECRET_KEY)` 앞 12자리
+- 수동 코드는 Firestore에서 유효 시간 내 충돌 여부를 확인합니다.
+- 충돌 시 1초 대기 대신 nonce 후보를 바꿔 즉시 다른 코드를 시도합니다.
+- 예약 당일의 `reserved` 상태 예약에 대해서만 발급합니다.
 
 ## 관리자 방문 확인
 
@@ -297,15 +341,21 @@ QR 해시 또는 수동 코드를 검증합니다.
 ```json
 {
   "token": "b6fc4c620b67d95f953a5c1c1230aaab",
-  "token_type": "auto"
+  "token_type": "qr"
 }
 ```
 
 `token_type`:
 
-- `auto`: QR/수동 코드 모두 대조
+- `auto`: Firestore에 발급 기록이 있는 수동 코드를 먼저 확인하고, 없으면 QR 해시만 대조
 - `qr`: QR 해시만 대조
-- `manual`: 수동 코드만 대조
+- `manual`: Firestore에 발급 기록이 있는 수동 코드만 대조
+
+권장:
+
+- 카메라 QR 스캔은 `token_type=qr`를 사용합니다.
+- 사람이 직접 입력한 수동 코드는 `token_type=manual`을 사용합니다.
+- `auto`는 호환용입니다. QR 스캔에서 `auto`를 쓰면 Firestore 수동 코드 조회가 먼저 발생할 수 있습니다.
 
 ### POST `/admin/visits/complete`
 

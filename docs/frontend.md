@@ -125,11 +125,13 @@ API:
 API:
 
 - `GET /users/me/visit-tokens`
+- `POST /users/me/visit-manual-code`
 
 구성:
 
 - 예약별 QR
-- 수동 코드 12자리
+- QR 인식이 안 될 때 누르는 수동 코드 발급 버튼
+- 발급된 수동 코드 12자리
 - 다음 코드 갱신까지 남은 시간을 보여주는 하단 게이지
 - 확인 완료 팝업
 
@@ -330,3 +332,18 @@ API:
 - 403이면 권한 없음, 예약 제한, IP 차단 중 어떤 상황인지 문맥에 맞게 안내합니다.
 - 409는 이미 처리된 작업입니다. 예: 이미 마감된 영업일
 - 422는 입력 형식 오류입니다. 해당 입력칸 아래에 표시합니다.
+
+## rev_002 프론트엔드 반영 사항
+
+- 방문 확인증 API는 방문 확인증 화면에 들어왔을 때만 호출합니다. 메인 화면에 있을 때 계속 갱신하지 않는 것은 프론트엔드의 업무입니다.
+- `GET /users/me/visit-tokens` 응답은 `{ tokens, message }` 객체입니다.
+- `tokens`가 비어 있으면 QR 영역 대신 `message`를 표시합니다.
+- 각 토큰에는 `schedule_title`, `product_name`, `quantity`, `time_slot_label`이 포함됩니다. QR 칸 위에 이 정보를 표시합니다.
+- `GET /users/me/visit-tokens`는 QR 표시용이며 수동 코드를 포함하지 않습니다.
+- QR 인식이 불가능해서 관리자가 수동 입력을 해야 할 때만 `POST /users/me/visit-manual-code`를 호출합니다.
+- 수동 코드 발급 버튼은 예약별 QR 칸 근처에 두되, 기본 화면 진입만으로 자동 호출하지 않습니다.
+- 관리자 QR 스캔 화면은 `POST /admin/visits/scan` 호출 시 `token_type=qr`를 보냅니다.
+- 관리자 수동 입력 화면은 `POST /admin/visits/scan` 호출 시 `token_type=manual`을 보냅니다.
+- `token_type=auto`는 호환용이며, QR 스캔의 기본값으로 쓰지 않습니다.
+- 미래 예약만 있는 경우 백엔드는 `방문 확인 코드는 예약 당일에만 발급됩니다.` 메시지를 반환합니다.
+- 과도한 요청 차단의 1차 방어는 Vercel Rewrites + Vercel KV에서 구현합니다. 백엔드 `DB_BASED_IP_BAN` 운영 기본값은 `false`입니다.

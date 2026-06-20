@@ -32,14 +32,19 @@ def token_material(user_uuid: str, reservation_uuid: str, counter: int) -> str:
     return f"{user_uuid}:{reservation_uuid}:{counter}"
 
 
+def manual_token_material(user_uuid: str, reservation_uuid: str, counter: int, nonce: int = 0) -> str:
+    base = token_material(user_uuid, reservation_uuid, counter)
+    return base if nonce == 0 else f"{base}:manual:{nonce}"
+
+
 def qr_hash(user_uuid: str, reservation_uuid: str, settings: Settings, counter: int | None = None) -> str:
     counter = current_counter(settings) if counter is None else counter
     return hash_token(token_material(user_uuid, reservation_uuid, counter), settings.otp_qr_hash_algorithm, settings.otp_secret_key)
 
 
-def manual_code(user_uuid: str, reservation_uuid: str, settings: Settings, counter: int | None = None) -> str:
+def manual_code(user_uuid: str, reservation_uuid: str, settings: Settings, counter: int | None = None, nonce: int = 0) -> str:
     counter = current_counter(settings) if counter is None else counter
-    raw = hash_token(token_material(user_uuid, reservation_uuid, counter), settings.otp_manual_hash_algorithm, settings.otp_secret_key)
+    raw = hash_token(manual_token_material(user_uuid, reservation_uuid, counter, nonce), settings.otp_manual_hash_algorithm, settings.otp_secret_key)
     return raw[: settings.otp_manual_code_length]
 
 
@@ -58,4 +63,3 @@ def verify_token(token: str, user_uuid: str, reservation_uuid: str, settings: Se
         if token_type in {"auto", "manual"} and hmac.compare_digest(normalized, manual_candidate.lower()):
             return True
     return False
-

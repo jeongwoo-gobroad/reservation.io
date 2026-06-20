@@ -101,7 +101,8 @@ def require_user(
     settings: Settings = Depends(load_settings),
     db: Session = Depends(get_db),
 ) -> User:
-    reject_banned_ip(request, db)
+    if settings.db_based_ip_ban:
+        reject_banned_ip(request, db)
     payload = verify_access_token(token, settings)
     if payload.get("scope") != "user":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="user token required")

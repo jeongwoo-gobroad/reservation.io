@@ -20,7 +20,8 @@ from .config import Settings, load_settings
 from .database import Base, engine, get_db
 from .database import SessionLocal
 from .message_bus import get_message_bus
-from .otp import manual_code, qr_hash, remaining_seconds, verify_token
+from .manual_code_registry import ManualCodeCollisionError, get_manual_code_registry
+from .otp import qr_hash, remaining_seconds, verify_token
 from .schemas import (
     AdminLoginRequest,
     AdminScanRequest,
@@ -34,6 +35,7 @@ from .schemas import (
     IpBanIn,
     IpBanOut,
     KakaoCodeExchangeRequest,
+    ManualVisitCodeRequest,
     NicknameRequest,
     PendingDayCloseOut,
     ReservationCreate,
@@ -47,7 +49,9 @@ from .schemas import (
     TokenResponse,
     UserOut,
     UserTokenResponse,
+    VisitManualCodeOut,
     VisitScanOut,
+    VisitTokenListOut,
     VisitTokenOut,
 )
 from .security import bearer_token, client_ip, create_access_token, reject_banned_ip, require_admin, require_user, verify_access_token
@@ -56,6 +60,7 @@ from .timezone import local_today
 
 settings = load_settings()
 message_bus = get_message_bus(settings)
+manual_code_registry = get_manual_code_registry(settings)
 BLOCKED_USER_MESSAGE_KEY = "blocked_user_message_markdown"
 DEFAULT_BLOCKED_USER_MESSAGE = "현재 접속이 제한되어 있습니다. 매장 관리자에게 문의해 주세요."
 RATE_LIMIT_SKIP_PATHS = {"/health", "/users/me/block-status", f"/settings/{BLOCKED_USER_MESSAGE_KEY}"}
@@ -86,6 +91,8 @@ app.add_middleware(
 
 @app.middleware("http")
 async def anti_macro_and_ip_ban_middleware(request: Request, call_next):
+    if not settings.db_based_ip_ban:
+        return await call_next(request)
     if request.method == "OPTIONS" or should_skip_rate_limit(request.url.path):
         return await call_next(request)
     db = SessionLocal()
@@ -210,7 +217,7 @@ def get_my_block_status(
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="user not found")
     actor_key = f"user:{user.uuid}"
-    ban = active_ip_ban(db, client_ip(request), actor_key)
+    ban = active_ip_ban(db, client_ip(request), actor_key) if settings.db_based_ip_ban else None
     return BlockStatusOut(
         blocked=bool(ban),
         ip_address=client_ip(request),
@@ -432,17 +439,19 @@ def create_reservation(
 
     reservations: list[models.Reservation] = []
     group_totals: dict[int, int] = defaultdict(int)
+    product_totals: dict[int, int] = defaultdict(int)
     for item in body.items:
         schedule_set = sets_by_uuid[item.schedule_set_uuid]
         product = products_by_uuid.get(item.product_uuid)
         if not product or product.schedule_set_id != schedule_set.id:
             raise HTTPException(status_code=400, detail="판매 일정에 속하지 않은 상품이 포함되어 있습니다.")
-        if item.quantity > product.per_user_limit:
+        product_totals[product.id] += item.quantity
+        if product_totals[product.id] > product.per_user_limit:
             raise HTTPException(status_code=400, detail=f"[{product.name}] 상품은 1인당 {product.per_user_limit}개까지 예약할 수 있습니다.")
         group_totals[product.group_id] += item.quantity
         if group_totals[product.group_id] > product.group.purchase_limit:
             raise HTTPException(status_code=400, detail=f"[{product.group.name}] 그룹은 총 {product.group.purchase_limit}개까지만 선택 가능합니다.")
-        if product.stock_quantity is not None and reserved_quantity(db, product.id) + item.quantity > product.stock_quantity:
+        if product.stock_quantity is not None and reserved_quantity(db, product.id) + product_totals[product.id] > product.stock_quantity:
             raise HTTPException(status_code=400, detail=f"[{product.name}] 상품의 재고가 부족합니다.")
         time_slot = None
         if schedule_set.has_time_slots:
@@ -612,27 +621,95 @@ def cancel_reservation(reservation_uuid: str, user: models.User = Depends(requir
     db.commit()
 
 
-@app.get("/users/me/visit-tokens", response_model=list[VisitTokenOut], tags=["visit"])
-def my_visit_tokens(user: models.User = Depends(require_user), db: Session = Depends(get_db)) -> list[VisitTokenOut]:
+@app.get("/users/me/visit-tokens", response_model=VisitTokenListOut, tags=["visit"])
+def my_visit_tokens(user: models.User = Depends(require_user), db: Session = Depends(get_db)) -> VisitTokenListOut:
     today = local_today(settings)
     rows = db.scalars(
-        select(models.Reservation).where(
+        select(models.Reservation)
+        .where(
             models.Reservation.user_id == user.id,
             models.Reservation.sale_date == today,
             models.Reservation.status == "reserved",
         )
+        .options(selectinload(models.Reservation.product), selectinload(models.Reservation.schedule_set), selectinload(models.Reservation.time_slot))
+        .order_by(models.Reservation.sale_date, models.Reservation.reserved_at)
     ).all()
-    window = f"t-{settings.otp_delta},t,t+{settings.otp_delta}" if settings.otp_delta else "t"
-    return [
-        VisitTokenOut(
-            reservation_uuid=row.uuid,
-            qr_hash=qr_hash(user.uuid, row.uuid, settings),
-            manual_code=manual_code(user.uuid, row.uuid, settings),
-            expires_in_seconds=remaining_seconds(settings),
-            hash_window=window,
+    if not rows:
+        future_exists = bool(
+            db.scalar(
+                select(models.Reservation.id).where(
+                    models.Reservation.user_id == user.id,
+                    models.Reservation.sale_date > today,
+                    models.Reservation.status == "reserved",
+                )
+            )
         )
-        for row in rows
-    ]
+        message = "방문 확인 코드는 예약 당일에만 발급됩니다." if future_exists else "오늘 발급 가능한 방문 확인 코드가 없습니다."
+        return VisitTokenListOut(tokens=[], message=message)
+    window = f"t-{settings.otp_delta},t,t+{settings.otp_delta}" if settings.otp_delta else "t"
+    tokens = []
+    for row in rows:
+        tokens.append(
+            VisitTokenOut(
+                reservation_uuid=row.uuid,
+                sale_date=row.sale_date,
+                schedule_set_uuid=row.schedule_set.uuid,
+                schedule_title=row.schedule_set.title,
+                product_name=row.product.name,
+                quantity=row.quantity,
+                time_slot_label=row.time_slot.label if row.time_slot else "",
+                qr_hash=qr_hash(user.uuid, row.uuid, settings),
+                expires_in_seconds=remaining_seconds(settings),
+                hash_window=window,
+            )
+        )
+    return VisitTokenListOut(tokens=tokens)
+
+
+@app.post("/users/me/visit-manual-code", response_model=VisitManualCodeOut, tags=["visit"])
+def issue_my_manual_visit_code(
+    body: ManualVisitCodeRequest,
+    user: models.User = Depends(require_user),
+    db: Session = Depends(get_db),
+) -> VisitManualCodeOut:
+    today = local_today(settings)
+    reservation = db.scalar(
+        select(models.Reservation)
+        .where(
+            models.Reservation.uuid == body.reservation_uuid,
+            models.Reservation.user_id == user.id,
+        )
+        .options(selectinload(models.Reservation.product), selectinload(models.Reservation.schedule_set), selectinload(models.Reservation.time_slot))
+    )
+    if not reservation:
+        raise HTTPException(status_code=404, detail="예약을 찾을 수 없습니다.")
+    if reservation.status != "reserved":
+        raise HTTPException(status_code=400, detail="방문 확인 코드 발급이 가능한 예약이 아닙니다.")
+    if reservation.sale_date > today:
+        raise HTTPException(status_code=400, detail="방문 확인 수동 코드는 예약 당일에만 발급됩니다.")
+    if reservation.sale_date < today:
+        raise HTTPException(status_code=400, detail="지난 예약은 방문 확인 수동 코드를 발급할 수 없습니다.")
+
+    try:
+        reserved_manual_code = manual_code_registry.reserve(user.uuid, reservation.uuid, settings)
+    except ManualCodeCollisionError as exc:
+        raise HTTPException(status_code=503, detail="수동 코드 충돌을 해결하지 못했습니다. 잠시 후 다시 시도해 주세요.") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="수동 코드 저장소를 사용할 수 없습니다. 잠시 후 다시 시도해 주세요.") from exc
+
+    window = f"t-{settings.otp_delta},t,t+{settings.otp_delta}" if settings.otp_delta else "t"
+    return VisitManualCodeOut(
+        reservation_uuid=reservation.uuid,
+        sale_date=reservation.sale_date,
+        schedule_set_uuid=reservation.schedule_set.uuid,
+        schedule_title=reservation.schedule_set.title,
+        product_name=reservation.product.name,
+        quantity=reservation.quantity,
+        time_slot_label=reservation.time_slot.label if reservation.time_slot else "",
+        manual_code=reserved_manual_code.code,
+        expires_in_seconds=remaining_seconds(settings),
+        hash_window=window,
+    )
 
 
 @app.post("/admin/visits/scan", response_model=VisitScanOut, tags=["admin-visit"])
@@ -641,13 +718,45 @@ def scan_visit_token(
     _: Annotated[dict, Depends(require_admin)],
     db: Session = Depends(get_db),
 ) -> VisitScanOut:
+    normalized_token = body.token.strip().lower()
+    if body.token_type in {"auto", "manual"}:
+        try:
+            resolved = manual_code_registry.resolve(normalized_token)
+        except Exception as exc:
+            if body.token_type == "manual":
+                raise HTTPException(status_code=503, detail="수동 코드 저장소를 사용할 수 없습니다. 잠시 후 다시 시도해 주세요.") from exc
+            resolved = None
+        if resolved:
+            reservation = db.scalar(
+                select(models.Reservation)
+                .where(
+                    models.Reservation.uuid == resolved.reservation_uuid,
+                    models.Reservation.status == "reserved",
+                    models.Reservation.sale_date == local_today(settings),
+                )
+                .options(
+                    selectinload(models.Reservation.user),
+                    selectinload(models.Reservation.product),
+                    selectinload(models.Reservation.schedule_set),
+                    selectinload(models.Reservation.time_slot),
+                )
+            )
+            if reservation and reservation.user.uuid == resolved.user_uuid:
+                return VisitScanOut(
+                    user_uuid=reservation.user.uuid,
+                    nickname=reservation.user.nickname,
+                    reservation=reservation_out(reservation),
+                )
+        if body.token_type == "manual":
+            raise HTTPException(status_code=400, detail="수동 코드가 만료되었거나 올바르지 않습니다.")
     rows = db.scalars(
         select(models.Reservation)
         .where(models.Reservation.status == "reserved", models.Reservation.sale_date == local_today(settings))
         .options(selectinload(models.Reservation.user), selectinload(models.Reservation.product), selectinload(models.Reservation.schedule_set), selectinload(models.Reservation.time_slot))
     ).all()
+    fallback_token_type = "qr" if body.token_type == "auto" else body.token_type
     for reservation in rows:
-        if verify_token(body.token, reservation.user.uuid, reservation.uuid, settings, body.token_type):
+        if verify_token(body.token, reservation.user.uuid, reservation.uuid, settings, fallback_token_type):
             return VisitScanOut(
                 user_uuid=reservation.user.uuid,
                 nickname=reservation.user.nickname,
