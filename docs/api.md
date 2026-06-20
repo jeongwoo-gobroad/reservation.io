@@ -7,11 +7,9 @@
 - 인증 방식: `Authorization: Bearer <access_token>`
 - 날짜 판단 기준: `APP_TIMEZONE`, 기본 `Asia/Seoul`
 - 화면 하단 시간 기준 문구: `DISPLAY_TIMEZONE_LABEL`
-- 반복 요청 차단 기준: 로그인된 같은 사용자, 같은 IP, 같은 API, 같은 1초 창에서 `ANTI_MACRO_DURATION`회 이상
-- 반복 요청 창 보존 시간: `ANTI_MACRO_RETENTION_SECONDS`, 기본 3600초
-- 자동 반복 요청 차단 범위: 같은 IP 전체가 아니라 `IP + 로그인 사용자`
-- 수동 IP 차단 또는 관리자 로그인 실패 차단 범위: 전체 IP
-- 운영 기본값: `DB_BASED_IP_BAN=false`이므로 과도한 요청 차단은 Vercel KV 쪽에서 먼저 처리합니다.
+- 백엔드는 IP 기반 차단을 수행하지 않습니다.
+- 반복 요청 차단은 Vercel Rewrites + Vercel KV 같은 프론트 프록시 계층에서 처리합니다.
+- 관리자 로그인 실패는 401만 반환하며, IP 차단 목록에 자동 등록하지 않습니다.
 
 ## 공통 응답
 
@@ -65,8 +63,8 @@
 중요 규칙:
 
 - 틀린 ID/PW는 401
-- 같은 IP에서 `ADMIN_LOGIN_FAIL_LIMIT`회 이상 실패하면 `ip_bans`에 자동 등록
-- 밴 IP는 로그인뿐 아니라 관리자 API 전체가 403으로 차단됨
+- 로그인 실패 횟수로 백엔드 IP 차단을 만들지 않음
+- 프록시 환경에서 IP 기반 차단은 실제 사람 단위가 아닐 수 있으므로 백엔드에서 사용하지 않음
 
 ### POST `/auth/kakao/exchange`
 
@@ -489,11 +487,11 @@ GET /admin/reservations?sale_date=2026-07-01&nickname=피카
 
 ### GET `/admin/ip-bans`
 
-IP 밴 목록입니다.
+IP 기반 차단은 비활성화되었습니다. 이 API는 호환을 위해 남아 있으며 빈 배열을 반환합니다.
 
 ### POST `/admin/ip-bans`
 
-IP 밴을 추가 또는 수정합니다.
+IP 밴 추가는 비활성화되었습니다. 호출하면 `410 Gone`을 반환합니다.
 
 ```json
 {
@@ -505,7 +503,7 @@ IP 밴을 추가 또는 수정합니다.
 
 ### DELETE `/admin/ip-bans/{ip_address}`
 
-IP 밴을 삭제합니다.
+호환용 no-op API입니다. 기존 프론트엔드 호출이 실패하지 않도록 204를 반환하지만, 실제 차단 로직은 없습니다.
 
 ## 설정
 

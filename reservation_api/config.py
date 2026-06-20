@@ -48,10 +48,6 @@ class Settings:
     otp_qr_hash_algorithm: str
     otp_manual_hash_algorithm: str
     otp_manual_code_length: int
-    admin_login_fail_limit: int
-    db_based_ip_ban: bool
-    anti_macro_duration: int
-    anti_macro_retention_seconds: int
     otp_manual_code_registry_backend: str
     otp_manual_code_collection: str
     otp_manual_code_max_attempts: int
@@ -87,10 +83,6 @@ def load_settings() -> Settings:
         otp_qr_hash_algorithm=os.getenv("OTP_QR_HASH_ALGORITHM", "md5"),
         otp_manual_hash_algorithm=os.getenv("OTP_MANUAL_HASH_ALGORITHM", "sha1"),
         otp_manual_code_length=max(6, _int_env("OTP_MANUAL_CODE_LENGTH", 12)),
-        admin_login_fail_limit=max(1, _int_env("ADMIN_LOGIN_FAIL_LIMIT", 5)),
-        db_based_ip_ban=_bool_env("DB_BASED_IP_BAN", False),
-        anti_macro_duration=max(1, _int_env("ANTI_MACRO_DURATION", 10)),
-        anti_macro_retention_seconds=max(60, _int_env("ANTI_MACRO_RETENTION_SECONDS", 3600)),
         otp_manual_code_registry_backend=os.getenv(
             "OTP_MANUAL_CODE_REGISTRY_BACKEND",
             "memory" if environment == "local" else "firestore",

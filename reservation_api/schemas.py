@@ -235,7 +235,7 @@ class IpBanIn(BaseModel):
     actor_key: str = ""
     user_uuid: str = ""
     nickname: str = ""
-    reason: str = Field("관리자 로그인 실패 누적")
+    reason: str = Field("IP 기반 차단 비활성화")
     active: bool = True
 
 

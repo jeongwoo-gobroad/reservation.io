@@ -79,7 +79,6 @@ https://pokecard-reservation.vercel.app/oauth/kakao/callback
 - 판매 일정 만들기
 - 현재 예약 현황
 - 노쇼/예약 제한
-- IP 밴 관리
 - 안내문 관리
 - 예약 동의 메시지 관리
 - 당일 영업 마감

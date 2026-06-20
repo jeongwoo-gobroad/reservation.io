@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from .config import Settings, load_settings
 from .database import get_db
-from .models import IpBan, User
+from .models import User
 
 
 def _b64url(data: bytes) -> str:
@@ -57,25 +57,6 @@ def client_ip(request: Request) -> str:
         return forwarded_for.split(",", 1)[0].strip()
     return request.client.host if request.client else "unknown"
 
-
-def reject_banned_ip(request: Request, db: Session) -> None:
-    ip_address = client_ip(request)
-    ban = db.scalar(select(IpBan).where(IpBan.ip_address == ip_address, IpBan.actor_key == "", IpBan.active.is_(True)))
-    if ban:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "code": "ip_banned",
-                "message": "blocked ip",
-                "ip_address": ban.ip_address,
-                "actor_key": getattr(ban, "actor_key", "") or "",
-                "user_uuid": getattr(ban, "user_uuid", "") or "",
-                "nickname": getattr(ban, "nickname", "") or "",
-                "reason": ban.reason,
-            },
-        )
-
-
 def bearer_token(authorization: str | None = Header(None)) -> str:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="missing bearer token")
@@ -83,12 +64,9 @@ def bearer_token(authorization: str | None = Header(None)) -> str:
 
 
 def require_admin(
-    request: Request,
     token: str = Depends(bearer_token),
     settings: Settings = Depends(load_settings),
-    db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    reject_banned_ip(request, db)
     payload = verify_access_token(token, settings)
     if payload.get("scope") != "admin":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin token required")
@@ -96,13 +74,10 @@ def require_admin(
 
 
 def require_user(
-    request: Request,
     token: str = Depends(bearer_token),
     settings: Settings = Depends(load_settings),
     db: Session = Depends(get_db),
 ) -> User:
-    if settings.db_based_ip_ban:
-        reject_banned_ip(request, db)
     payload = verify_access_token(token, settings)
     if payload.get("scope") != "user":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="user token required")

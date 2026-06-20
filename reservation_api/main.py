@@ -1,24 +1,21 @@
 from __future__ import annotations
 
 import json
-import re
 import urllib.parse
 import urllib.request
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from sqlalchemy import delete, func, select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from . import models
 from .config import Settings, load_settings
 from .database import Base, engine, get_db
-from .database import SessionLocal
 from .message_bus import get_message_bus
 from .manual_code_registry import ManualCodeCollisionError, get_manual_code_registry
 from .otp import qr_hash, remaining_seconds, verify_token
@@ -54,7 +51,7 @@ from .schemas import (
     VisitTokenListOut,
     VisitTokenOut,
 )
-from .security import bearer_token, client_ip, create_access_token, reject_banned_ip, require_admin, require_user, verify_access_token
+from .security import bearer_token, client_ip, create_access_token, require_admin, require_user, verify_access_token
 from .timezone import local_today
 
 
@@ -63,10 +60,6 @@ message_bus = get_message_bus(settings)
 manual_code_registry = get_manual_code_registry(settings)
 BLOCKED_USER_MESSAGE_KEY = "blocked_user_message_markdown"
 DEFAULT_BLOCKED_USER_MESSAGE = "현재 접속이 제한되어 있습니다. 매장 관리자에게 문의해 주세요."
-RATE_LIMIT_SKIP_PATHS = {"/health", "/users/me/block-status", f"/settings/{BLOCKED_USER_MESSAGE_KEY}"}
-RATE_LIMIT_SKIP_PREFIXES = ("/swagger", "/redoc", "/openapi.json")
-IP_BAN_READABLE_PATHS = {"/health", "/auth/kakao/exchange", "/users/me/block-status", f"/settings/{BLOCKED_USER_MESSAGE_KEY}"}
-UUID_PATH_PART = re.compile(r"/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?=/|$)")
 
 app = FastAPI(
     title="Pokecard Reservation API",
@@ -88,28 +81,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-@app.middleware("http")
-async def anti_macro_and_ip_ban_middleware(request: Request, call_next):
-    if not settings.db_based_ip_ban:
-        return await call_next(request)
-    if request.method == "OPTIONS" or should_skip_rate_limit(request.url.path):
-        return await call_next(request)
-    db = SessionLocal()
-    try:
-        ip_address = client_ip(request)
-        actor_key, _, _ = rate_limit_actor(db, request)
-        ban = active_ip_ban(db, ip_address, actor_key)
-        if ban and request.url.path not in IP_BAN_READABLE_PATHS:
-            return ip_ban_response(request, db, ban)
-        triggered_ban = apply_anti_macro_limit(db, request, ip_address)
-        if triggered_ban:
-            return ip_ban_response(request, db, triggered_ban)
-    finally:
-        db.close()
-    return await call_next(request)
-
-
 @app.on_event("startup")
 def create_local_dev_schema() -> None:
     if settings.is_dev_mode and settings.database_url.startswith("sqlite"):
@@ -122,31 +93,11 @@ def health() -> dict[str, str]:
 
 
 @app.post("/admin/login", response_model=TokenResponse, tags=["admin-auth"])
-def admin_login(request: Request, body: AdminLoginRequest, db: Session = Depends(get_db)) -> TokenResponse:
-    reject_banned_ip(request, db)
-    ip_address = client_ip(request)
+def admin_login(body: AdminLoginRequest) -> TokenResponse:
     ok = body.admin_id == settings.admin_id and body.password == settings.admin_password
-    attempt = db.scalar(select(models.AdminLoginAttempt).where(models.AdminLoginAttempt.ip_address == ip_address))
     if not ok:
-        if not attempt:
-            attempt = models.AdminLoginAttempt(ip_address=ip_address)
-            db.add(attempt)
-        attempt.failure_count = (attempt.failure_count or 0) + 1
-        attempt.last_failed_at = models.now_utc()
-        if attempt.failure_count >= settings.admin_login_fail_limit:
-            ban = db.scalar(select(models.IpBan).where(models.IpBan.ip_address == ip_address, models.IpBan.actor_key == ""))
-            if not ban:
-                db.add(models.IpBan(ip_address=ip_address, reason="관리자 로그인 5회 이상 실패", active=True))
-            else:
-                ban.active = True
-                ban.reason = "관리자 로그인 5회 이상 실패"
-        db.commit()
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid admin credentials")
 
-    if attempt:
-        attempt.failure_count = 0
-        attempt.last_failed_at = None
-    db.commit()
     return TokenResponse(access_token=create_access_token("admin", "admin", settings), expires_in_seconds=43200)
 
 
@@ -217,15 +168,14 @@ def get_my_block_status(
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="user not found")
     actor_key = f"user:{user.uuid}"
-    ban = active_ip_ban(db, client_ip(request), actor_key) if settings.db_based_ip_ban else None
     return BlockStatusOut(
-        blocked=bool(ban),
+        blocked=False,
         ip_address=client_ip(request),
         actor_key=actor_key,
         user_uuid=user.uuid,
         nickname=user.nickname,
-        reason=ban.reason if ban else "",
-        message_markdown=setting_value(db, BLOCKED_USER_MESSAGE_KEY, DEFAULT_BLOCKED_USER_MESSAGE) if ban else "",
+        reason="",
+        message_markdown="",
     )
 
 
@@ -942,38 +892,22 @@ def remove_banned_user(user_uuid: str, _: Annotated[dict, Depends(require_admin)
 
 
 @app.get("/admin/ip-bans", response_model=list[IpBanOut], tags=["admin-ip-bans"])
-def list_ip_bans(_: Annotated[dict, Depends(require_admin)], db: Session = Depends(get_db)) -> list[models.IpBan]:
-    return list(db.scalars(select(models.IpBan).order_by(models.IpBan.created_at.desc())).all())
+def list_ip_bans(_: Annotated[dict, Depends(require_admin)]) -> list[models.IpBan]:
+    return []
 
 
 @app.post("/admin/ip-bans", response_model=IpBanOut, status_code=201, tags=["admin-ip-bans"])
-def add_ip_ban(body: IpBanIn, _: Annotated[dict, Depends(require_admin)], db: Session = Depends(get_db)) -> models.IpBan:
-    ban = db.scalar(select(models.IpBan).where(models.IpBan.ip_address == body.ip_address, models.IpBan.actor_key == body.actor_key))
-    if not ban:
-        ban = models.IpBan(ip_address=body.ip_address, actor_key=body.actor_key)
-        db.add(ban)
-    ban.actor_key = body.actor_key
-    ban.user_uuid = body.user_uuid
-    ban.nickname = body.nickname
-    ban.reason = body.reason
-    ban.active = body.active
-    db.commit()
-    db.refresh(ban)
-    return ban
+def add_ip_ban(body: IpBanIn, _: Annotated[dict, Depends(require_admin)]) -> models.IpBan:
+    raise HTTPException(status_code=status.HTTP_410_GONE, detail="IP 기반 차단은 비활성화되었습니다. Vercel 단의 요청 제한을 사용해 주세요.")
 
 
 @app.delete("/admin/ip-bans/{ip_address}", status_code=204, tags=["admin-ip-bans"])
 def delete_ip_ban(
     ip_address: str,
     _: Annotated[dict, Depends(require_admin)],
-    db: Session = Depends(get_db),
     actor_key: str | None = None,
 ) -> None:
-    stmt = delete(models.IpBan).where(models.IpBan.ip_address == ip_address)
-    if actor_key is not None:
-        stmt = stmt.where(models.IpBan.actor_key == actor_key)
-    db.execute(stmt)
-    db.commit()
+    return None
 
 
 @app.get("/admin/settings/{key}", response_model=SettingOut, tags=["admin-settings"])
@@ -1196,145 +1130,3 @@ def is_user_banned(db: Session, user: models.User) -> bool:
 def setting_value(db: Session, key: str, default: str) -> str:
     setting = db.get(models.AppSetting, key)
     return setting.value if setting else default
-
-
-def should_skip_rate_limit(path: str) -> bool:
-    return path in RATE_LIMIT_SKIP_PATHS or any(path.startswith(prefix) for prefix in RATE_LIMIT_SKIP_PREFIXES)
-
-
-def active_ip_ban(db: Session, ip_address: str, actor_key: str = "") -> models.IpBan | None:
-    actor_candidates = [""] if not actor_key else ["", actor_key]
-    return db.scalar(
-        select(models.IpBan)
-        .where(
-            models.IpBan.ip_address == ip_address,
-            models.IpBan.actor_key.in_(actor_candidates),
-            models.IpBan.active.is_(True),
-        )
-        .order_by(models.IpBan.actor_key.desc())
-    )
-
-
-def ip_ban_response(request: Request, db: Session, ban: models.IpBan) -> JSONResponse:
-    message = setting_value(db, BLOCKED_USER_MESSAGE_KEY, DEFAULT_BLOCKED_USER_MESSAGE)
-    payload = {
-        "detail": {
-            "code": "ip_banned",
-            "message": message,
-            "ip_address": ban.ip_address,
-            "actor_key": ban.actor_key,
-            "user_uuid": ban.user_uuid,
-            "nickname": ban.nickname,
-            "reason": ban.reason,
-        }
-    }
-    response = JSONResponse(status_code=status.HTTP_403_FORBIDDEN, content=payload)
-    origin = request.headers.get("origin")
-    if origin and origin in settings.cors_allowed_origins:
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers["Vary"] = "Origin"
-    return response
-
-
-def rate_limit_actor(db: Session, request: Request) -> tuple[str, str, str]:
-    authorization = request.headers.get("authorization", "")
-    if not authorization.lower().startswith("bearer "):
-        return "", "", ""
-    token = authorization.split(" ", 1)[1].strip()
-    try:
-        payload = verify_access_token(token, settings)
-    except HTTPException:
-        return "", "", ""
-    if payload.get("scope") == "admin":
-        return "admin", "", "관리자"
-    if payload.get("scope") != "user":
-        return "", "", ""
-    user = db.scalar(select(models.User).where(models.User.uuid == payload.get("sub")))
-    if not user:
-        return "", "", ""
-    return f"user:{user.uuid}", user.uuid, user.nickname
-
-
-def rate_limit_route_key(request: Request) -> str:
-    normalized_path = UUID_PATH_PART.sub("/{uuid}", request.url.path)
-    return f"{request.method.upper()} {normalized_path}"
-
-
-def rate_limit_window_start(now: datetime) -> datetime:
-    return now.replace(microsecond=0)
-
-
-def apply_anti_macro_limit(db: Session, request: Request, ip_address: str) -> models.IpBan | None:
-    now = models.now_utc()
-    actor_key, user_uuid, nickname = rate_limit_actor(db, request)
-    if not actor_key:
-        return None
-
-    route_key = rate_limit_route_key(request)
-    window_started_at = rate_limit_window_start(now)
-    cleanup_before = now - timedelta(seconds=settings.anti_macro_retention_seconds)
-    db.execute(delete(models.IpRateLimit).where(models.IpRateLimit.window_started_at < cleanup_before))
-
-    row = db.scalar(
-        select(models.IpRateLimit)
-        .where(
-            models.IpRateLimit.ip_address == ip_address,
-            models.IpRateLimit.actor_key == actor_key,
-            models.IpRateLimit.route_key == route_key,
-            models.IpRateLimit.window_started_at == window_started_at,
-        )
-        .with_for_update()
-    )
-    if not row:
-        row = models.IpRateLimit(
-            ip_address=ip_address,
-            actor_key=actor_key,
-            user_uuid=user_uuid,
-            nickname=nickname,
-            route_key=route_key,
-            window_started_at=window_started_at,
-            request_count=0,
-        )
-        db.add(row)
-        try:
-            db.flush()
-        except IntegrityError:
-            db.rollback()
-            row = db.scalar(
-                select(models.IpRateLimit)
-                .where(
-                    models.IpRateLimit.ip_address == ip_address,
-                    models.IpRateLimit.actor_key == actor_key,
-                    models.IpRateLimit.route_key == route_key,
-                    models.IpRateLimit.window_started_at == window_started_at,
-                )
-                .with_for_update()
-            )
-            if not row:
-                raise
-
-    row.request_count += 1
-    row.updated_at = now
-    row.user_uuid = user_uuid or row.user_uuid
-    row.nickname = nickname or row.nickname
-    if row.request_count < settings.anti_macro_duration:
-        db.commit()
-        return None
-
-    reason = f"초당 동일 API 요청 {row.request_count}회 감지(차단 기준 {settings.anti_macro_duration}회, API {route_key})"
-    ban = db.scalar(
-        select(models.IpBan)
-        .where(models.IpBan.ip_address == ip_address, models.IpBan.actor_key == actor_key)
-        .with_for_update()
-    )
-    if not ban:
-        ban = models.IpBan(ip_address=ip_address, actor_key=actor_key)
-        db.add(ban)
-    ban.active = True
-    ban.user_uuid = row.user_uuid
-    ban.nickname = row.nickname
-    ban.reason = reason
-    db.commit()
-    db.refresh(ban)
-    return ban
