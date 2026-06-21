@@ -127,6 +127,37 @@ class Reservation(Base):
     __table_args__ = (Index("ix_reservations_user_date_status", "user_id", "sale_date", "status"),)
 
 
+class ReservationRequest(Base):
+    __tablename__ = "reservation_requests"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    uuid: Mapped[str] = mapped_column(String(36), unique=True, index=True, default=new_uuid)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    user_uuid: Mapped[str] = mapped_column(String(36), index=True)
+    sale_date: Mapped[date] = mapped_column(Date, index=True)
+    action: Mapped[str] = mapped_column(String(16), default="create", index=True)
+    target_reservation_uuid: Mapped[str] = mapped_column(String(36), default="", index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(96))
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    payload_json: Mapped[str] = mapped_column(Text)
+    result_json: Mapped[str] = mapped_column(Text, default="")
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    task_name: Mapped[str] = mapped_column(String(512), default="")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    user: Mapped[User] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "idempotency_key", name="uq_reservation_requests_user_idempotency"),
+        Index("ix_reservation_requests_user_status", "user_id", "status"),
+        Index("ix_reservation_requests_target_status", "target_reservation_uuid", "status"),
+        Index("ix_reservation_requests_status_created", "status", "created_at"),
+    )
+
+
 class CompletedVisit(Base):
     __tablename__ = "completed_visits"
 
@@ -180,51 +211,6 @@ class BannedUser(Base):
     reason: Mapped[str] = mapped_column(String(240), default="")
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
-
-
-class IpBan(Base):
-    __tablename__ = "ip_bans"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    ip_address: Mapped[str] = mapped_column(String(64), index=True)
-    actor_key: Mapped[str] = mapped_column(String(96), default="", index=True)
-    user_uuid: Mapped[str] = mapped_column(String(36), default="")
-    nickname: Mapped[str] = mapped_column(String(64), default="")
-    reason: Mapped[str] = mapped_column(String(240), default="")
-    active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
-
-    __table_args__ = (UniqueConstraint("ip_address", "actor_key", name="uq_ip_bans_ip_actor"),)
-
-
-class IpRateLimit(Base):
-    __tablename__ = "ip_rate_limits"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    ip_address: Mapped[str] = mapped_column(String(64), index=True)
-    actor_key: Mapped[str] = mapped_column(String(96), index=True)
-    user_uuid: Mapped[str] = mapped_column(String(36), default="")
-    nickname: Mapped[str] = mapped_column(String(64), default="")
-    route_key: Mapped[str] = mapped_column(String(180), index=True)
-    window_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
-    request_count: Mapped[int] = mapped_column(Integer, default=0)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
-
-    __table_args__ = (
-        UniqueConstraint("ip_address", "actor_key", "route_key", "window_started_at", name="uq_ip_rate_limits_scope_window"),
-        Index("ix_ip_rate_limits_window_started_at", "window_started_at"),
-    )
-
-
-class AdminLoginAttempt(Base):
-    __tablename__ = "admin_login_attempts"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    ip_address: Mapped[str] = mapped_column(String(64), unique=True, index=True)
-    failure_count: Mapped[int] = mapped_column(Integer, default=0)
-    last_failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
 
 

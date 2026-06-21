@@ -11,10 +11,15 @@
 권장 환경변수:
 
 ```text
-NEXT_PUBLIC_API_BASE_URL=https://reservation-api-xxxx.a.run.app
+BACKEND_API_BASE_URL=https://reservation-api-xxxx.a.run.app
+RESERVATION_GATEWAY_SECRET=...
+WAITING_ROOM_ENABLED=true
+WAITING_ROOM_MAX_ACTIVE=...
+WAITING_ROOM_LEASE_SECONDS=60
+WAITING_ROOM_POLL_SECONDS=2
 ```
 
-정적 HTML/JS만 쓰는 경우에도 빌드 시 `config.js`를 만들거나 배포 환경변수에서 API 주소를 읽는 구조를 두십시오.
+`BACKEND_API_BASE_URL`과 `RESERVATION_GATEWAY_SECRET`은 Vercel Function 서버 코드에서만 사용합니다. 브라우저에 노출되는 `NEXT_PUBLIC_` 값으로 만들지 마십시오.
 
 ## 2. Vercel 프로젝트 생성
 
@@ -26,7 +31,7 @@ NEXT_PUBLIC_API_BASE_URL=https://reservation-api-xxxx.a.run.app
    - 순수 정적 HTML이면 `Other`
    - Next.js면 `Next.js`
 6. Build Command와 Output Directory를 설정합니다.
-7. Environment Variables에 API 주소를 넣습니다.
+7. Environment Variables에 Vercel Function용 백엔드 주소, gateway secret, waiting room 설정을 넣습니다.
 8. Deploy를 누릅니다.
 
 ## 3. 백엔드 CORS 설정
@@ -87,6 +92,22 @@ https://pokecard-reservation.vercel.app/oauth/kakao/callback
 
 1. Vercel URL을 엽니다.
 2. 카카오 로그인 버튼이 보이는지 확인합니다.
-3. 브라우저 개발자 도구 Network 탭에서 백엔드 API 호출 주소가 Cloud Run URL인지 확인합니다.
+3. 브라우저 개발자 도구 Network 탭에서 예약 생성/수정/취소와 관리자 오픈/마감이 Vercel Function 경로를 거치는지 확인합니다.
 4. CORS 오류가 있으면 백엔드 `_CORS_ALLOWED_ORIGINS`를 확인합니다.
 5. 운영 백엔드는 `IS_DEV_MODE=false`여야 합니다.
+
+## 7. Vercel Function이 필요한 경로
+
+아래 경로는 단순 Rewrite로 Cloud Run에 넘기지 말고 Vercel Function으로 구현하십시오.
+
+- `POST /api/reservation-requests`
+- `PATCH /api/reservations/{reservation_uuid}`
+- `DELETE /api/reservations/{reservation_uuid}`
+- `POST /api/admin/schedule-dates/{sale_date}/open`
+- `POST /api/admin/schedule-dates/{sale_date}/close`
+
+역할:
+
+- 예약 생성/수정/취소 Function은 Vercel Redis waiting room을 확인한 뒤 Cloud Run에 `X-Reservation-Gateway-Secret`을 붙여 호출합니다.
+- 관리자 오픈/마감 Function은 Cloud Run 응답의 `waiting_room_sync`를 읽어 Vercel Redis `wr:open:{sale_date}`를 갱신합니다.
+- 자세한 구현 지침은 `docs/rev_003.md`와 `docs/rev_004.md`를 기준으로 합니다.

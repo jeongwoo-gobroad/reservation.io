@@ -1,43 +1,57 @@
 from __future__ import annotations
 
 import json
+import hmac
 import urllib.parse
 import urllib.request
-from collections import defaultdict
-from datetime import date, datetime
+from datetime import date
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from . import models
-from .config import Settings, load_settings
+from .config import load_settings
 from .database import Base, engine, get_db
 from .message_bus import get_message_bus
 from .manual_code_registry import ManualCodeCollisionError, get_manual_code_registry
 from .otp import qr_hash, remaining_seconds, verify_token
+from .read_models import (
+    completed_out,
+    completed_row,
+    is_user_banned,
+    pending_day_close_out,
+    reservation_count,
+    reservation_out,
+    reservation_request_out,
+    schedule_out,
+    setting_value,
+)
+from .reservation_queue import ReservationQueueError, enqueue_reservation_request
+from .reservation_service import mutation_payload_json, process_reservation_request, reservation_payload_json
 from .schemas import (
     AdminLoginRequest,
     AdminScanRequest,
     BannedUserIn,
     BannedUserOut,
-    BlockStatusOut,
     CompleteVisitRequest,
     CompletedVisitOut,
     DayCloseOut,
     DayCloseRequest,
-    IpBanIn,
-    IpBanOut,
     KakaoCodeExchangeRequest,
     ManualVisitCodeRequest,
     NicknameRequest,
     PendingDayCloseOut,
     ReservationCreate,
     ReservationOut,
-    ReservationPatch,
+    ReservationRequestCreate,
+    ReservationRequestOut,
+    ReservationUpdateRequestCreate,
+    ReservationWorkerRequest,
+    ScheduleDateOperationOut,
     ScheduleSetCreate,
     ScheduleSetOut,
     ScheduleSetPatch,
@@ -50,16 +64,15 @@ from .schemas import (
     VisitScanOut,
     VisitTokenListOut,
     VisitTokenOut,
+    WaitingRoomSyncOut,
 )
-from .security import bearer_token, client_ip, create_access_token, require_admin, require_user, verify_access_token
+from .security import create_access_token, require_admin, require_user
 from .timezone import local_today
 
 
 settings = load_settings()
 message_bus = get_message_bus(settings)
 manual_code_registry = get_manual_code_registry(settings)
-BLOCKED_USER_MESSAGE_KEY = "blocked_user_message_markdown"
-DEFAULT_BLOCKED_USER_MESSAGE = "현재 접속이 제한되어 있습니다. 매장 관리자에게 문의해 주세요."
 
 app = FastAPI(
     title="Pokecard Reservation API",
@@ -90,6 +103,162 @@ def create_local_dev_schema() -> None:
 @app.get("/health", tags=["system"])
 def health() -> dict[str, str]:
     return {"status": "ok", "service": settings.service_name, "environment": settings.environment}
+
+
+def require_reservation_gateway(
+    x_reservation_gateway_secret: str | None = Header(None, alias="X-Reservation-Gateway-Secret"),
+) -> None:
+    if settings.reservation_gateway_secret and not hmac.compare_digest(
+        x_reservation_gateway_secret or "",
+        settings.reservation_gateway_secret,
+    ):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="reservation gateway required")
+
+
+def require_reservation_worker(
+    x_reservation_worker_secret: str | None = Header(None, alias="X-Reservation-Worker-Secret"),
+) -> None:
+    if settings.reservation_worker_secret and not hmac.compare_digest(
+        x_reservation_worker_secret or "",
+        settings.reservation_worker_secret,
+    ):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="reservation worker required")
+
+
+IN_FLIGHT_REQUEST_STATUSES = ("pending", "enqueued", "processing")
+
+
+def submit_reservation_request(
+    request: Request,
+    db: Session,
+    request_row: models.ReservationRequest,
+) -> ReservationRequestOut:
+    db.add(request_row)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        existing = db.scalar(
+            select(models.ReservationRequest).where(
+                models.ReservationRequest.user_id == request_row.user_id,
+                models.ReservationRequest.idempotency_key == request_row.idempotency_key,
+            )
+        )
+        if existing:
+            return require_matching_existing_request(
+                db,
+                existing,
+                request_row.action,
+                request_row.target_reservation_uuid,
+            )
+        raise
+    db.refresh(request_row)
+
+    if settings.reservation_queue_backend == "inline":
+        processed = process_reservation_request(db, request_row.uuid)
+        return reservation_request_out(db, processed)
+    if settings.reservation_queue_backend == "none":
+        return reservation_request_out(db, request_row)
+
+    worker_url = settings.reservation_worker_url or str(request.url_for("process_reservation_worker"))
+    try:
+        task_name = enqueue_reservation_request(request_row.uuid, settings, worker_url)
+    except ReservationQueueError as exc:
+        request_row = db.scalar(select(models.ReservationRequest).where(models.ReservationRequest.id == request_row.id))
+        if request_row:
+            request_row.status = "enqueue_failed"
+            request_row.error_message = str(exc)
+            request_row.updated_at = models.now_utc()
+            db.commit()
+            return reservation_request_out(db, request_row)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    db.expire(request_row)
+    request_row = db.scalar(
+        select(models.ReservationRequest)
+        .where(models.ReservationRequest.id == request_row.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if not request_row:
+        raise HTTPException(status_code=404, detail="reservation request not found")
+    if request_row.status == "pending":
+        request_row.status = "enqueued"
+        request_row.task_name = task_name
+        request_row.updated_at = models.now_utc()
+        db.commit()
+    return reservation_request_out(db, request_row)
+
+
+def find_existing_reservation_request(db: Session, user_id: int, idempotency_key: str) -> models.ReservationRequest | None:
+    return db.scalar(
+        select(models.ReservationRequest).where(
+            models.ReservationRequest.user_id == user_id,
+            models.ReservationRequest.idempotency_key == idempotency_key,
+        )
+    )
+
+
+def require_matching_existing_request(
+    db: Session,
+    existing: models.ReservationRequest,
+    action: str,
+    target_reservation_uuid: str = "",
+) -> ReservationRequestOut:
+    if existing.action != action or existing.target_reservation_uuid != target_reservation_uuid:
+        raise HTTPException(status_code=409, detail="같은 idempotency key가 다른 예약 변경 요청에 이미 사용되었습니다.")
+    return reservation_request_out(db, existing)
+
+
+def require_mutable_reservation_for_request(
+    db: Session,
+    user_id: int,
+    reservation_uuid: str,
+) -> models.Reservation:
+    reservation = db.scalar(
+        select(models.Reservation)
+        .where(
+            models.Reservation.uuid == reservation_uuid,
+            models.Reservation.user_id == user_id,
+            models.Reservation.status == "reserved",
+        )
+        .with_for_update()
+    )
+    if not reservation:
+        raise HTTPException(status_code=404, detail="변경 가능한 예약을 찾을 수 없습니다.")
+    existing_in_flight = db.scalar(
+        select(models.ReservationRequest)
+        .where(
+            models.ReservationRequest.user_id == user_id,
+            models.ReservationRequest.target_reservation_uuid == reservation_uuid,
+            models.ReservationRequest.action.in_(["update", "cancel"]),
+            models.ReservationRequest.status.in_(IN_FLIGHT_REQUEST_STATUSES),
+        )
+        .with_for_update()
+    )
+    if existing_in_flight:
+        raise HTTPException(status_code=409, detail="이미 처리 대기 중인 예약 변경 요청이 있습니다.")
+    return reservation
+
+
+def waiting_room_sync_payload(sale_date: date, desired_open: bool, event: str, schedules_count: int) -> WaitingRoomSyncOut:
+    redis_key = f"wr:open:{sale_date.isoformat()}"
+    effective_open = desired_open and schedules_count > 0
+    if desired_open and schedules_count == 0:
+        message = "해당 날짜에 등록된 판매 일정이 없어 Vercel waiting room을 열지 않습니다."
+    elif effective_open:
+        message = "Vercel Redis에서 이 날짜 waiting room을 열어 주세요."
+    else:
+        message = "Vercel Redis에서 이 날짜 waiting room을 닫아 주세요."
+    return WaitingRoomSyncOut(
+        sale_date=sale_date,
+        redis_key=redis_key,
+        desired_open=effective_open,
+        redis_value="1" if effective_open else "0",
+        delete_key=not effective_open,
+        event=event,
+        message=message,
+    )
 
 
 @app.post("/admin/login", response_model=TokenResponse, tags=["admin-auth"])
@@ -153,30 +322,6 @@ def kakao_exchange(body: KakaoCodeExchangeRequest, db: Session = Depends(get_db)
 @app.get("/users/me", response_model=UserOut, tags=["users"])
 def get_me(user: models.User = Depends(require_user)) -> models.User:
     return user
-
-
-@app.get("/users/me/block-status", response_model=BlockStatusOut, tags=["users"])
-def get_my_block_status(
-    request: Request,
-    token: str = Depends(bearer_token),
-    db: Session = Depends(get_db),
-) -> BlockStatusOut:
-    payload = verify_access_token(token, settings)
-    if payload.get("scope") != "user":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="user token required")
-    user = db.scalar(select(models.User).where(models.User.uuid == payload.get("sub")))
-    if not user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="user not found")
-    actor_key = f"user:{user.uuid}"
-    return BlockStatusOut(
-        blocked=False,
-        ip_address=client_ip(request),
-        actor_key=actor_key,
-        user_uuid=user.uuid,
-        nickname=user.nickname,
-        reason="",
-        message_markdown="",
-    )
 
 
 @app.patch("/users/me/nickname", response_model=UserOut, tags=["users"])
@@ -278,22 +423,42 @@ def delete_schedule_set(schedule_set_uuid: str, _: Annotated[dict, Depends(requi
     db.commit()
 
 
-@app.post("/admin/schedule-dates/{sale_date}/open", response_model=list[ScheduleSetOut], tags=["admin-schedules"])
-def open_schedule_date(sale_date: date, _: Annotated[dict, Depends(require_admin)], db: Session = Depends(get_db)) -> list[ScheduleSetOut]:
+@app.post("/admin/schedule-dates/{sale_date}/open", response_model=ScheduleDateOperationOut, tags=["admin-schedules"])
+def open_schedule_date(sale_date: date, _: Annotated[dict, Depends(require_admin)], db: Session = Depends(get_db)) -> ScheduleDateOperationOut:
     rows = db.scalars(select(models.ScheduleSet).where(models.ScheduleSet.sale_date == sale_date)).all()
     for row in rows:
         row.reservation_open = True
     db.commit()
-    return [schedule_out(db, row, include_remaining=True) for row in rows]
+    schedules = [schedule_out(db, row, include_remaining=True) for row in rows]
+    return ScheduleDateOperationOut(
+        sale_date=sale_date,
+        schedules=schedules,
+        waiting_room_sync=waiting_room_sync_payload(
+            sale_date,
+            desired_open=True,
+            event="schedule_date_opened",
+            schedules_count=len(rows),
+        ),
+    )
 
 
-@app.post("/admin/schedule-dates/{sale_date}/close", response_model=list[ScheduleSetOut], tags=["admin-schedules"])
-def close_schedule_date(sale_date: date, _: Annotated[dict, Depends(require_admin)], db: Session = Depends(get_db)) -> list[ScheduleSetOut]:
+@app.post("/admin/schedule-dates/{sale_date}/close", response_model=ScheduleDateOperationOut, tags=["admin-schedules"])
+def close_schedule_date(sale_date: date, _: Annotated[dict, Depends(require_admin)], db: Session = Depends(get_db)) -> ScheduleDateOperationOut:
     rows = db.scalars(select(models.ScheduleSet).where(models.ScheduleSet.sale_date == sale_date)).all()
     for row in rows:
         row.reservation_open = False
     db.commit()
-    return [schedule_out(db, row, include_remaining=True) for row in rows]
+    schedules = [schedule_out(db, row, include_remaining=True) for row in rows]
+    return ScheduleDateOperationOut(
+        sale_date=sale_date,
+        schedules=schedules,
+        waiting_room_sync=waiting_room_sync_payload(
+            sale_date,
+            desired_open=False,
+            event="schedule_date_closed",
+            schedules_count=len(rows),
+        ),
+    )
 
 
 @app.post("/admin/schedule-dates/{sale_date}/reset-reservations", tags=["admin-schedules"])
@@ -328,104 +493,69 @@ def admin_reservations(
     return [reservation_out(row) for row in rows]
 
 
-@app.post("/reservations", response_model=list[ReservationOut], status_code=201, tags=["reservations"])
+@app.post("/reservations", include_in_schema=False, tags=["reservations"])
 def create_reservation(
     body: ReservationCreate,
     user: models.User = Depends(require_user),
     db: Session = Depends(get_db),
-) -> list[ReservationOut]:
+) -> None:
+    raise HTTPException(status_code=410, detail="예약 생성은 POST /reservation-requests를 사용해 주세요.")
+
+
+@app.post("/reservation-requests", response_model=ReservationRequestOut, status_code=202, tags=["reservation-requests"])
+def create_reservation_request(
+    request: Request,
+    body: ReservationRequestCreate,
+    _: Annotated[None, Depends(require_reservation_gateway)],
+    user: models.User = Depends(require_user),
+    db: Session = Depends(get_db),
+) -> ReservationRequestOut:
     if not body.items:
         raise HTTPException(status_code=400, detail="예약할 상품을 선택해 주세요.")
-    locked_user = db.scalar(select(models.User).where(models.User.id == user.id).with_for_update())
-    if not locked_user:
-        raise HTTPException(status_code=401, detail="user not found")
-    user = locked_user
-    selected_set_uuids = {item.schedule_set_uuid for item in body.items}
-    sets = db.scalars(
-        select(models.ScheduleSet)
-        .where(models.ScheduleSet.uuid.in_(selected_set_uuids))
-        .options(selectinload(models.ScheduleSet.time_slots))
-        .order_by(models.ScheduleSet.id)
-        .with_for_update()
-    ).all()
-    sets_by_uuid = {row.uuid: row for row in sets}
-    if len(sets_by_uuid) != len(selected_set_uuids):
-        raise HTTPException(status_code=400, detail="유효하지 않은 판매 일정이 포함되어 있습니다.")
-    if any(row.sale_date != body.sale_date or not row.reservation_open for row in sets):
-        raise HTTPException(status_code=400, detail="예약 가능한 일정이 아닙니다.")
-    if len(selected_set_uuids) > 1 and any(not row.can_bundle for row in sets):
-        blocked = ", ".join(row.title for row in sets if not row.can_bundle)
-        raise HTTPException(status_code=400, detail=f"[{blocked}] 일정은 같은 날짜의 다른 일정과 함께 예약할 수 없습니다.")
-    if is_user_banned(db, user):
-        raise HTTPException(status_code=403, detail="예약이 제한된 사용자입니다.")
-    already_consumed = db.scalars(
-        select(models.Reservation.schedule_set_id).where(
-            models.Reservation.user_id == user.id,
-            models.Reservation.schedule_set_id.in_([row.id for row in sets]),
-            models.Reservation.status.in_(["visited", "no_show"]),
-        )
-    ).all()
-    if already_consumed:
-        consumed_ids = set(already_consumed)
-        blocked_titles = ", ".join(row.title for row in sets if row.id in consumed_ids)
-        raise HTTPException(status_code=400, detail=f"[{blocked_titles}] 일정은 이미 수령 완료 또는 노쇼 처리되어 다시 예약할 수 없습니다.")
-    if active_reservations_for_date(db, user.id, body.sale_date):
-        raise HTTPException(status_code=400, detail="이미 같은 날짜의 예약이 있습니다. 변경은 기존 예약 취소 후 다시 진행해 주세요.")
+    idempotency_key = (body.idempotency_key or "").strip() or models.new_uuid()
+    existing = find_existing_reservation_request(db, user.id, idempotency_key)
+    if existing:
+        return require_matching_existing_request(db, existing, "create", "")
 
-    products = db.scalars(
-        select(models.SaleProduct)
-        .where(models.SaleProduct.uuid.in_({item.product_uuid for item in body.items}))
-        .order_by(models.SaleProduct.id)
-        .with_for_update()
-    ).all()
-    products_by_uuid = {row.uuid: row for row in products}
-    time_slots = db.scalars(
-        select(models.TimeSlot)
-        .where(models.TimeSlot.uuid.in_({item.time_slot_uuid for item in body.items if item.time_slot_uuid}))
-        .order_by(models.TimeSlot.id)
-        .with_for_update()
-    ).all()
-    time_slots_by_uuid = {row.uuid: row for row in time_slots}
+    payload_body = ReservationCreate(sale_date=body.sale_date, items=body.items)
+    request_row = models.ReservationRequest(
+        user_id=user.id,
+        user_uuid=user.uuid,
+        sale_date=body.sale_date,
+        action="create",
+        target_reservation_uuid="",
+        idempotency_key=idempotency_key,
+        payload_json=reservation_payload_json(payload_body),
+        status="pending",
+    )
+    return submit_reservation_request(request, db, request_row)
 
-    reservations: list[models.Reservation] = []
-    group_totals: dict[int, int] = defaultdict(int)
-    product_totals: dict[int, int] = defaultdict(int)
-    for item in body.items:
-        schedule_set = sets_by_uuid[item.schedule_set_uuid]
-        product = products_by_uuid.get(item.product_uuid)
-        if not product or product.schedule_set_id != schedule_set.id:
-            raise HTTPException(status_code=400, detail="판매 일정에 속하지 않은 상품이 포함되어 있습니다.")
-        product_totals[product.id] += item.quantity
-        if product_totals[product.id] > product.per_user_limit:
-            raise HTTPException(status_code=400, detail=f"[{product.name}] 상품은 1인당 {product.per_user_limit}개까지 예약할 수 있습니다.")
-        group_totals[product.group_id] += item.quantity
-        if group_totals[product.group_id] > product.group.purchase_limit:
-            raise HTTPException(status_code=400, detail=f"[{product.group.name}] 그룹은 총 {product.group.purchase_limit}개까지만 선택 가능합니다.")
-        if product.stock_quantity is not None and reserved_quantity(db, product.id) + product_totals[product.id] > product.stock_quantity:
-            raise HTTPException(status_code=400, detail=f"[{product.name}] 상품의 재고가 부족합니다.")
-        time_slot = None
-        if schedule_set.has_time_slots:
-            if not item.time_slot_uuid:
-                raise HTTPException(status_code=400, detail=f"[{schedule_set.title}] 방문 시간을 선택해 주세요.")
-            time_slot = time_slots_by_uuid.get(item.time_slot_uuid)
-            if not time_slot or time_slot.schedule_set_id != schedule_set.id:
-                raise HTTPException(status_code=400, detail="유효하지 않은 방문 시간입니다.")
-            if time_slot.capacity is not None and reserved_customers_for_slot(db, time_slot.id) >= time_slot.capacity:
-                raise HTTPException(status_code=400, detail=f"[{time_slot.label}] 방문 시간대 예약이 모두 찼습니다.")
-        reservation = models.Reservation(
-            user_id=user.id,
-            schedule_set_id=schedule_set.id,
-            product_id=product.id,
-            time_slot_id=time_slot.id if time_slot else None,
-            sale_date=body.sale_date,
-            quantity=item.quantity,
+
+@app.get("/reservation-requests/{request_uuid}", response_model=ReservationRequestOut, tags=["reservation-requests"])
+def get_reservation_request(
+    request_uuid: str,
+    user: models.User = Depends(require_user),
+    db: Session = Depends(get_db),
+) -> ReservationRequestOut:
+    request_row = db.scalar(
+        select(models.ReservationRequest).where(
+            models.ReservationRequest.uuid == request_uuid,
+            models.ReservationRequest.user_id == user.id,
         )
-        db.add(reservation)
-        reservations.append(reservation)
-    db.commit()
-    for reservation in reservations:
-        db.refresh(reservation)
-    return [reservation_out(row) for row in reservations]
+    )
+    if not request_row:
+        raise HTTPException(status_code=404, detail="reservation request not found")
+    return reservation_request_out(db, request_row)
+
+
+@app.post("/internal/reservation-worker", response_model=ReservationRequestOut, tags=["internal"])
+def process_reservation_worker(
+    body: ReservationWorkerRequest,
+    _: Annotated[None, Depends(require_reservation_worker)],
+    db: Session = Depends(get_db),
+) -> ReservationRequestOut:
+    request_row = process_reservation_request(db, body.request_uuid)
+    return reservation_request_out(db, request_row)
 
 
 @app.get("/users/me/reservations", response_model=list[ReservationOut], tags=["reservations"])
@@ -439,136 +569,58 @@ def my_reservations(user: models.User = Depends(require_user), db: Session = Dep
     return [reservation_out(row) for row in rows]
 
 
-@app.patch("/reservations/{reservation_uuid}", response_model=ReservationOut, tags=["reservations"])
+@app.patch("/reservations/{reservation_uuid}", response_model=ReservationRequestOut, status_code=202, tags=["reservations"])
 def update_reservation(
     reservation_uuid: str,
-    body: ReservationPatch,
+    request: Request,
+    body: ReservationUpdateRequestCreate,
+    _: Annotated[None, Depends(require_reservation_gateway)],
     user: models.User = Depends(require_user),
     db: Session = Depends(get_db),
-) -> ReservationOut:
-    locked_user = db.scalar(select(models.User).where(models.User.id == user.id).with_for_update())
-    if not locked_user:
-        raise HTTPException(status_code=401, detail="user not found")
-    reservation = db.scalar(
-        select(models.Reservation)
-        .where(
-            models.Reservation.uuid == reservation_uuid,
-            models.Reservation.user_id == user.id,
-            models.Reservation.status == "reserved",
-        )
-        .options(
-            selectinload(models.Reservation.product).selectinload(models.SaleProduct.group),
-            selectinload(models.Reservation.schedule_set),
-            selectinload(models.Reservation.time_slot),
-        )
-        .with_for_update()
+) -> ReservationRequestOut:
+    idempotency_key = (body.idempotency_key or "").strip() or models.new_uuid()
+    existing = find_existing_reservation_request(db, user.id, idempotency_key)
+    if existing:
+        return require_matching_existing_request(db, existing, "update", reservation_uuid)
+    reservation = require_mutable_reservation_for_request(db, user.id, reservation_uuid)
+    request_row = models.ReservationRequest(
+        user_id=user.id,
+        user_uuid=user.uuid,
+        sale_date=reservation.sale_date,
+        action="update",
+        target_reservation_uuid=reservation.uuid,
+        idempotency_key=idempotency_key,
+        payload_json=mutation_payload_json(body),
+        status="pending",
     )
-    if not reservation:
-        raise HTTPException(status_code=404, detail="수정 가능한 예약을 찾을 수 없습니다.")
+    return submit_reservation_request(request, db, request_row)
 
-    schedule_set = db.scalar(
-        select(models.ScheduleSet)
-        .where(models.ScheduleSet.id == reservation.schedule_set_id)
-        .options(selectinload(models.ScheduleSet.time_slots))
-        .with_for_update()
+
+@app.delete("/reservations/{reservation_uuid}", response_model=ReservationRequestOut, status_code=202, tags=["reservations"])
+def cancel_reservation(
+    reservation_uuid: str,
+    request: Request,
+    _: Annotated[None, Depends(require_reservation_gateway)],
+    user: models.User = Depends(require_user),
+    db: Session = Depends(get_db),
+    idempotency_key_header: str | None = Header(None, alias="Idempotency-Key"),
+) -> ReservationRequestOut:
+    idempotency_key = (idempotency_key_header or "").strip() or models.new_uuid()
+    existing = find_existing_reservation_request(db, user.id, idempotency_key)
+    if existing:
+        return require_matching_existing_request(db, existing, "cancel", reservation_uuid)
+    reservation = require_mutable_reservation_for_request(db, user.id, reservation_uuid)
+    request_row = models.ReservationRequest(
+        user_id=user.id,
+        user_uuid=user.uuid,
+        sale_date=reservation.sale_date,
+        action="cancel",
+        target_reservation_uuid=reservation.uuid,
+        idempotency_key=idempotency_key,
+        payload_json="{}",
+        status="pending",
     )
-    product = db.scalar(
-        select(models.SaleProduct)
-        .where(models.SaleProduct.id == reservation.product_id)
-        .options(selectinload(models.SaleProduct.group))
-        .with_for_update()
-    )
-    if not product or not schedule_set:
-        raise HTTPException(status_code=404, detail="예약 일정 또는 상품을 찾을 수 없습니다.")
-
-    new_quantity = body.quantity if body.quantity is not None else reservation.quantity
-    if new_quantity > product.per_user_limit:
-        raise HTTPException(status_code=400, detail=f"[{product.name}] 상품은 1인당 {product.per_user_limit}개까지 예약할 수 있습니다.")
-
-    existing_group_total = int(
-        db.scalar(
-            select(func.coalesce(func.sum(models.Reservation.quantity), 0))
-            .join(models.SaleProduct, models.SaleProduct.id == models.Reservation.product_id)
-            .where(
-                models.Reservation.user_id == user.id,
-                models.Reservation.schedule_set_id == reservation.schedule_set_id,
-                models.Reservation.status == "reserved",
-                models.Reservation.id != reservation.id,
-                models.SaleProduct.group_id == product.group_id,
-            )
-        )
-        or 0
-    )
-    if existing_group_total + new_quantity > product.group.purchase_limit:
-        raise HTTPException(status_code=400, detail=f"[{product.group.name}] 그룹은 총 {product.group.purchase_limit}개까지 선택 가능합니다.")
-
-    if product.stock_quantity is not None:
-        next_reserved_quantity = reserved_quantity(db, product.id) - reservation.quantity + new_quantity
-        if next_reserved_quantity > product.stock_quantity:
-            raise HTTPException(status_code=400, detail=f"[{product.name}] 상품의 남은 재고가 부족합니다.")
-
-    provided_fields = getattr(body, "model_fields_set", getattr(body, "__fields_set__", set()))
-    next_time_slot_id = reservation.time_slot_id
-    if schedule_set.has_time_slots:
-        if "time_slot_uuid" in provided_fields:
-            if not body.time_slot_uuid:
-                raise HTTPException(status_code=400, detail="방문 시간을 선택해 주세요.")
-            next_slot = db.scalar(
-                select(models.TimeSlot)
-                .where(models.TimeSlot.uuid == body.time_slot_uuid, models.TimeSlot.schedule_set_id == schedule_set.id)
-                .with_for_update()
-            )
-            if not next_slot:
-                raise HTTPException(status_code=400, detail="유효하지 않은 방문 시간입니다.")
-            if next_slot.id != reservation.time_slot_id and next_slot.capacity is not None:
-                already_counted = bool(
-                    db.scalar(
-                        select(models.Reservation.id).where(
-                            models.Reservation.time_slot_id == next_slot.id,
-                            models.Reservation.user_id == user.id,
-                            models.Reservation.status == "reserved",
-                            models.Reservation.id != reservation.id,
-                        )
-                    )
-                )
-                if not already_counted and reserved_customers_for_slot(db, next_slot.id) >= next_slot.capacity:
-                    raise HTTPException(status_code=400, detail=f"[{next_slot.label}] 방문 시간은 예약이 모두 찼습니다.")
-            next_time_slot_id = next_slot.id
-    elif "time_slot_uuid" in provided_fields and body.time_slot_uuid:
-        raise HTTPException(status_code=400, detail="이 일정은 방문 시간을 나누어 받지 않습니다.")
-
-    reservation.quantity = new_quantity
-    reservation.time_slot_id = next_time_slot_id
-    reservation.updated_at = models.now_utc()
-    db.commit()
-    updated = db.scalar(
-        select(models.Reservation)
-        .where(models.Reservation.id == reservation.id)
-        .options(selectinload(models.Reservation.product), selectinload(models.Reservation.schedule_set), selectinload(models.Reservation.time_slot))
-    )
-    if not updated:
-        raise HTTPException(status_code=404, detail="수정된 예약을 찾을 수 없습니다.")
-    return reservation_out(updated)
-
-
-@app.delete("/reservations/{reservation_uuid}", status_code=204, tags=["reservations"])
-def cancel_reservation(reservation_uuid: str, user: models.User = Depends(require_user), db: Session = Depends(get_db)) -> None:
-    locked_user = db.scalar(select(models.User).where(models.User.id == user.id).with_for_update())
-    if not locked_user:
-        raise HTTPException(status_code=401, detail="user not found")
-    reservation = db.scalar(
-        select(models.Reservation)
-        .where(
-            models.Reservation.uuid == reservation_uuid,
-            models.Reservation.user_id == user.id,
-            models.Reservation.status == "reserved",
-        )
-        .with_for_update()
-    )
-    if not reservation:
-        raise HTTPException(status_code=404, detail="예약을 찾을 수 없습니다.")
-    reservation.status = "cancelled"
-    db.commit()
+    return submit_reservation_request(request, db, request_row)
 
 
 @app.get("/users/me/visit-tokens", response_model=VisitTokenListOut, tags=["visit"])
@@ -891,25 +943,6 @@ def remove_banned_user(user_uuid: str, _: Annotated[dict, Depends(require_admin)
         db.commit()
 
 
-@app.get("/admin/ip-bans", response_model=list[IpBanOut], tags=["admin-ip-bans"])
-def list_ip_bans(_: Annotated[dict, Depends(require_admin)]) -> list[models.IpBan]:
-    return []
-
-
-@app.post("/admin/ip-bans", response_model=IpBanOut, status_code=201, tags=["admin-ip-bans"])
-def add_ip_ban(body: IpBanIn, _: Annotated[dict, Depends(require_admin)]) -> models.IpBan:
-    raise HTTPException(status_code=status.HTTP_410_GONE, detail="IP 기반 차단은 비활성화되었습니다. Vercel 단의 요청 제한을 사용해 주세요.")
-
-
-@app.delete("/admin/ip-bans/{ip_address}", status_code=204, tags=["admin-ip-bans"])
-def delete_ip_ban(
-    ip_address: str,
-    _: Annotated[dict, Depends(require_admin)],
-    actor_key: str | None = None,
-) -> None:
-    return None
-
-
 @app.get("/admin/settings/{key}", response_model=SettingOut, tags=["admin-settings"])
 def get_setting(key: str, _: Annotated[dict, Depends(require_admin)], db: Session = Depends(get_db)) -> SettingOut:
     return SettingOut(key=key, value=setting_value(db, key, ""))
@@ -934,7 +967,7 @@ def put_setting(
 
 @app.get("/settings/{key}", response_model=SettingOut, tags=["settings"])
 def public_setting(key: str, db: Session = Depends(get_db)) -> SettingOut:
-    public_keys = {"disclaimer_markdown", "reservation_agreement_markdown", BLOCKED_USER_MESSAGE_KEY}
+    public_keys = {"disclaimer_markdown", "reservation_agreement_markdown"}
     if key not in public_keys:
         raise HTTPException(status_code=404, detail="public setting not found")
     return SettingOut(key=key, value=setting_value(db, key, ""))
@@ -949,184 +982,3 @@ def require_schedule_set(db: Session, schedule_set_uuid: str) -> models.Schedule
     if not schedule_set:
         raise HTTPException(status_code=404, detail="판매 일정을 찾을 수 없습니다.")
     return schedule_set
-
-
-def schedule_out(db: Session, row: models.ScheduleSet, include_remaining: bool = False) -> ScheduleSetOut:
-    return ScheduleSetOut(
-        uuid=row.uuid,
-        sale_date=row.sale_date,
-        title=row.title,
-        can_bundle=row.can_bundle,
-        has_time_slots=row.has_time_slots,
-        reservation_open=row.reservation_open,
-        products=[
-            {
-                "uuid": product.uuid,
-                "group_uuid": product.group.uuid,
-                "group_name": product.group.name,
-                "group_purchase_limit": product.group.purchase_limit,
-                "name": product.name,
-                "stock_quantity": product.stock_quantity,
-                "stock_remaining": stock_remaining(db, product) if include_remaining else None,
-                "per_user_limit": product.per_user_limit,
-            }
-            for product in row.products
-        ],
-        time_slots=[
-            {
-                "uuid": slot.uuid,
-                "code": slot.code,
-                "label": slot.label,
-                "capacity": slot.capacity,
-                "remaining_customers": time_slot_remaining(db, slot) if include_remaining else None,
-            }
-            for slot in sorted(row.time_slots, key=lambda item: item.code)
-        ],
-    )
-
-
-def reservation_out(row: models.Reservation) -> ReservationOut:
-    return ReservationOut(
-        uuid=row.uuid,
-        sale_date=row.sale_date,
-        schedule_set_uuid=row.schedule_set.uuid,
-        schedule_title=row.schedule_set.title,
-        product_uuid=row.product.uuid,
-        product_name=row.product.name,
-        quantity=row.quantity,
-        time_slot_uuid=row.time_slot.uuid if row.time_slot else None,
-        time_slot_label=row.time_slot.label if row.time_slot else "",
-        status=row.status,
-        reserved_at=row.reserved_at,
-    )
-
-
-def completed_row(row: models.Reservation, no_show: bool) -> models.CompletedVisit:
-    return models.CompletedVisit(
-        reservation_id=row.id,
-        reservation_uuid=row.uuid,
-        user_id=row.user_id,
-        user_uuid=row.user.uuid,
-        sale_date=row.sale_date,
-        nickname=row.user.nickname,
-        schedule_title=row.schedule_set.title,
-        product_name=row.product.name,
-        quantity=row.quantity,
-        time_slot_label=row.time_slot.label if row.time_slot else "",
-        no_show=no_show,
-    )
-
-
-def completed_out(row: models.CompletedVisit) -> CompletedVisitOut:
-    return CompletedVisitOut(
-        uuid=row.uuid,
-        reservation_uuid=row.reservation_uuid,
-        user_uuid=row.user_uuid,
-        nickname=row.nickname,
-        sale_date=row.sale_date,
-        schedule_title=row.schedule_title,
-        product_name=row.product_name,
-        quantity=row.quantity,
-        time_slot_label=row.time_slot_label,
-        no_show=row.no_show,
-        completed_at=row.completed_at,
-    )
-
-
-def pending_day_close_out(db: Session, sale_date: date) -> PendingDayCloseOut:
-    reserved_rows = db.scalars(
-        select(models.Reservation.user_id).where(
-            models.Reservation.sale_date == sale_date,
-            models.Reservation.status == "reserved",
-        )
-    ).all()
-    return PendingDayCloseOut(
-        sale_date=sale_date,
-        schedule_count=int(
-            db.scalar(
-                select(func.count(models.ScheduleSet.id)).where(models.ScheduleSet.sale_date == sale_date)
-            )
-            or 0
-        ),
-        reserved_reservations=len(reserved_rows),
-        visited_reservations=reservation_count(db, sale_date, "visited"),
-        no_show_reservations=reservation_count(db, sale_date, "no_show"),
-        cancelled_reservations=reservation_count(db, sale_date, "cancelled"),
-        expected_no_show_users=len(set(reserved_rows)),
-    )
-
-
-def active_reservations_for_date(db: Session, user_id: int, sale_date: date) -> list[models.Reservation]:
-    return list(
-        db.scalars(
-            select(models.Reservation).where(
-                models.Reservation.user_id == user_id,
-                models.Reservation.sale_date == sale_date,
-                models.Reservation.status == "reserved",
-            )
-        ).all()
-    )
-
-
-def reservation_count(db: Session, sale_date: date, status_value: str) -> int:
-    return int(
-        db.scalar(
-            select(func.count(models.Reservation.id)).where(
-                models.Reservation.sale_date == sale_date,
-                models.Reservation.status == status_value,
-            )
-        )
-        or 0
-    )
-
-
-def reserved_quantity(db: Session, product_id: int) -> int:
-    return int(
-        db.scalar(
-            select(func.coalesce(func.sum(models.Reservation.quantity), 0)).where(
-                models.Reservation.product_id == product_id,
-                models.Reservation.status == "reserved",
-            )
-        )
-        or 0
-    )
-
-
-def stock_remaining(db: Session, product: models.SaleProduct) -> int | None:
-    if product.stock_quantity is None:
-        return None
-    return max(0, product.stock_quantity - reserved_quantity(db, product.id))
-
-
-def reserved_customers_for_slot(db: Session, time_slot_id: int) -> int:
-    return int(
-        db.scalar(
-            select(func.count(func.distinct(models.Reservation.user_id))).where(
-                models.Reservation.time_slot_id == time_slot_id,
-                models.Reservation.status == "reserved",
-            )
-        )
-        or 0
-    )
-
-
-def time_slot_remaining(db: Session, slot: models.TimeSlot) -> int | None:
-    if slot.capacity is None:
-        return None
-    return max(0, slot.capacity - reserved_customers_for_slot(db, slot.id))
-
-
-def is_user_banned(db: Session, user: models.User) -> bool:
-    return bool(
-        db.scalar(
-            select(models.BannedUser).where(
-                models.BannedUser.user_uuid == user.uuid,
-                models.BannedUser.active.is_(True),
-            )
-        )
-    )
-
-
-def setting_value(db: Session, key: str, default: str) -> str:
-    setting = db.get(models.AppSetting, key)
-    return setting.value if setting else default

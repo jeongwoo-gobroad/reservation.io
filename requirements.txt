@@ -6,3 +6,4 @@ alembic>=1.13
 psycopg[binary]>=3.2
 google-cloud-pubsub>=2.22
 google-cloud-firestore>=2.16
+google-cloud-tasks>=2.16

@@ -297,3 +297,62 @@ Secret 환경변수:
 
 - 운영에서는 정상입니다.
 - 개발/검증용 배포에서만 `IS_DEV_MODE=true`로 열어야 합니다.
+
+## 12. rev_003 Cloud Tasks 예약 접수 설정
+
+예약이 한 번에 몰리는 시간에는 Vercel Redis 대기실에서 먼저 입장을 조절하고, 입장된 사람만 Cloud Run의 예약 접수 API를 호출합니다. Cloud Run은 먼저 SQL에 `pending` 접수 내역을 저장한 뒤 Cloud Tasks에 처리 작업을 맡기고, worker가 SQL 트랜잭션 안에서 최종 예약을 확정합니다.
+
+### 필요한 API
+
+Google Cloud Console에서 `APIs & Services`로 이동해 아래 API가 활성화되어 있는지 확인합니다.
+
+- Cloud Tasks API
+- Cloud Run API
+- Cloud SQL Admin API
+- Secret Manager API
+
+### Cloud Tasks Queue 만들기
+
+1. Google Cloud Console에서 `Cloud Tasks`를 엽니다.
+2. `Create queue`를 누릅니다.
+3. Queue name은 `reservation-requests`로 입력합니다.
+4. Region은 Cloud Run과 같은 `asia-northeast3`로 선택합니다.
+5. 초당 처리량은 매장 운영 규모에 맞게 낮게 시작합니다. 예: 초당 10-30건
+6. 동시에 처리할 작업 수는 DB가 안정적으로 처리할 수 있는 값으로 시작합니다. 예: 5-20
+7. 저장합니다.
+
+초당 처리량과 동시 처리 수는 "예약을 얼마나 빨리 확정할지"와 "DB에 순간적으로 얼마나 부담을 줄지"를 조절하는 손잡이입니다. 처음에는 보수적으로 시작하고, 실제 예약 시작 시간의 모니터링 결과를 보며 올리는 편이 안전합니다.
+
+### Secret Manager에 추가할 값
+
+`Secret Manager`에서 아래 Secret을 새로 만듭니다. 두 값은 길고 예측하기 어려운 문자열로 생성하십시오.
+
+- `reservation-gateway-secret`: Vercel Function이 Cloud Run 예약 접수 API를 호출할 때만 쓰는 비밀값
+- `reservation-worker-secret`: Cloud Tasks worker API가 내부 호출임을 확인할 때 쓰는 비밀값
+
+브라우저에 직접 노출되는 `NEXT_PUBLIC_` 환경변수에는 이 값을 절대 넣지 않습니다. Vercel 서버 함수와 Cloud Run만 알고 있어야 합니다.
+
+### Cloud Build substitution 확인
+
+`cloudbuild.yaml`에는 아래 값이 들어가야 합니다.
+
+- `_RESERVATION_QUEUE_BACKEND`: `cloud_tasks`
+- `_CLOUD_TASKS_PROJECT_ID`: `reservation-io`
+- `_CLOUD_TASKS_LOCATION`: `asia-northeast3`
+- `_CLOUD_TASKS_QUEUE`: `reservation-requests`
+- `_RESERVATION_WORKER_URL`: Cloud Run worker 전체 URL. 예: `https://.../internal/reservation-worker`
+- `_CLOUD_TASKS_SERVICE_ACCOUNT_EMAIL`: Cloud Tasks가 OIDC 토큰을 붙일 때 사용할 서비스 계정
+- `_RESERVATION_GATEWAY_SECRET_SECRET`: `reservation-gateway-secret`
+- `_RESERVATION_WORKER_SECRET_SECRET`: `reservation-worker-secret`
+
+첫 배포 후 Cloud Run 서비스 URL을 확인하고 `_RESERVATION_WORKER_URL`에는 반드시 `/internal/reservation-worker`까지 붙인 전체 주소를 넣어 주십시오. 값을 비워 두면 요청 host를 기준으로 추정하지만, Vercel Rewrite를 거친 환경에서는 의도하지 않은 주소가 들어갈 수 있습니다.
+
+### IAM 권한
+
+Cloud Run 실행 서비스 계정인 `reservation-api-runner@reservation-io.iam.gserviceaccount.com`에는 아래 권한이 필요합니다.
+
+- `roles/cloudtasks.enqueuer`
+- `roles/cloudsql.client`
+- `roles/secretmanager.secretAccessor`
+
+Cloud Tasks가 OIDC로 Cloud Run을 호출하도록 잠글 계획이라면, Cloud Tasks가 사용하는 서비스 계정에 Cloud Run 호출 권한도 부여해야 합니다. 현재 백엔드 worker는 추가로 `reservation-worker-secret` 헤더를 검사하므로, 실수로 외부에서 worker 주소를 알아도 비밀값 없이는 처리되지 않습니다.

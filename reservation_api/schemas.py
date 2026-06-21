@@ -110,6 +110,22 @@ class ScheduleSetOut(BaseModel):
     time_slots: list[TimeSlotOut]
 
 
+class WaitingRoomSyncOut(BaseModel):
+    sale_date: date
+    redis_key: str
+    desired_open: bool
+    redis_value: str
+    delete_key: bool = False
+    event: Literal["schedule_date_opened", "schedule_date_closed"]
+    message: str = ""
+
+
+class ScheduleDateOperationOut(BaseModel):
+    sale_date: date
+    schedules: list[ScheduleSetOut]
+    waiting_room_sync: WaitingRoomSyncOut
+
+
 class ReservationItemIn(BaseModel):
     schedule_set_uuid: str
     product_uuid: str
@@ -122,9 +138,32 @@ class ReservationCreate(BaseModel):
     items: list[ReservationItemIn]
 
 
+class ReservationRequestCreate(ReservationCreate):
+    action: Literal["create"] = "create"
+    idempotency_key: str | None = Field(
+        None,
+        min_length=8,
+        max_length=96,
+        examples=["client-generated-reservation-attempt-uuid"],
+    )
+
+
+class ReservationWorkerRequest(BaseModel):
+    request_uuid: str
+
+
 class ReservationPatch(BaseModel):
     quantity: int | None = Field(None, ge=1)
     time_slot_uuid: str | None = None
+
+
+class ReservationUpdateRequestCreate(ReservationPatch):
+    idempotency_key: str | None = Field(
+        None,
+        min_length=8,
+        max_length=96,
+        examples=["client-generated-update-attempt-uuid"],
+    )
 
 
 class ReservationOut(BaseModel):
@@ -139,6 +178,21 @@ class ReservationOut(BaseModel):
     time_slot_label: str
     status: str
     reserved_at: datetime
+
+
+class ReservationRequestOut(BaseModel):
+    request_uuid: str
+    action: Literal["create", "update", "cancel"]
+    status: Literal["pending", "enqueued", "processing", "success", "failed", "enqueue_failed"]
+    sale_date: date
+    target_reservation_uuid: str = ""
+    idempotency_key: str
+    error_message: str = ""
+    reservations: list[ReservationOut] = Field(default_factory=list)
+    attempts: int
+    created_at: datetime
+    updated_at: datetime
+    finished_at: datetime | None = None
 
 
 class VisitTokenOut(BaseModel):
@@ -230,23 +284,6 @@ class DayCloseOut(BaseModel):
     auto_banned_users: int
 
 
-class IpBanIn(BaseModel):
-    ip_address: str = Field(..., examples=["203.0.113.10"])
-    actor_key: str = ""
-    user_uuid: str = ""
-    nickname: str = ""
-    reason: str = Field("IP 기반 차단 비활성화")
-    active: bool = True
-
-
-class IpBanOut(IpBanIn):
-    id: int
-    created_at: datetime
-    updated_at: datetime
-
-    model_config = {"from_attributes": True}
-
-
 class BannedUserOut(BaseModel):
     id: int
     user_uuid: str
@@ -272,13 +309,3 @@ class SettingUpdate(BaseModel):
 class SettingOut(BaseModel):
     key: str
     value: str
-
-
-class BlockStatusOut(BaseModel):
-    blocked: bool
-    ip_address: str
-    actor_key: str
-    user_uuid: str
-    nickname: str
-    reason: str = ""
-    message_markdown: str = ""

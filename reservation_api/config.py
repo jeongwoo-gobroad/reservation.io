@@ -58,6 +58,15 @@ class Settings:
     app_timezone: str
     message_bus_backend: str
     visit_event_topic: str
+    reservation_queue_backend: str
+    reservation_gateway_secret: str
+    reservation_worker_secret: str
+    reservation_worker_url: str
+    cloud_tasks_project_id: str
+    cloud_tasks_location: str
+    cloud_tasks_queue: str
+    cloud_tasks_service_account_email: str
+    cloud_tasks_audience: str
 
 
 @lru_cache(maxsize=1)
@@ -96,4 +105,16 @@ def load_settings() -> Settings:
         app_timezone=os.getenv("APP_TIMEZONE", "Asia/Seoul"),
         message_bus_backend=os.getenv("MESSAGE_BUS_BACKEND", "none"),
         visit_event_topic=os.getenv("VISIT_EVENT_TOPIC", ""),
+        reservation_queue_backend=os.getenv(
+            "RESERVATION_QUEUE_BACKEND",
+            "inline" if environment == "local" else "cloud_tasks",
+        ).strip().lower(),
+        reservation_gateway_secret=os.getenv("RESERVATION_GATEWAY_SECRET", ""),
+        reservation_worker_secret=os.getenv("RESERVATION_WORKER_SECRET", ""),
+        reservation_worker_url=os.getenv("RESERVATION_WORKER_URL", ""),
+        cloud_tasks_project_id=os.getenv("CLOUD_TASKS_PROJECT_ID", os.getenv("GCP_PROJECT", os.getenv("GOOGLE_CLOUD_PROJECT", ""))),
+        cloud_tasks_location=os.getenv("CLOUD_TASKS_LOCATION", os.getenv("REGION", "asia-northeast3")),
+        cloud_tasks_queue=os.getenv("CLOUD_TASKS_QUEUE", "reservation-requests"),
+        cloud_tasks_service_account_email=os.getenv("CLOUD_TASKS_SERVICE_ACCOUNT_EMAIL", ""),
+        cloud_tasks_audience=os.getenv("CLOUD_TASKS_AUDIENCE", ""),
     )

@@ -76,7 +76,7 @@ API:
 API:
 
 - `GET /schedules/open`
-- `POST /reservations`
+- `POST /reservation-requests`
 - `GET /settings/reservation_agreement_markdown`
 
 표시 규칙:
@@ -97,7 +97,7 @@ API:
 예약 전 확인:
 
 - `reservation_agreement_markdown`을 팝업으로 보여줍니다.
-- 이용자가 확인한 뒤에만 `POST /reservations`를 호출합니다.
+- 이용자가 확인한 뒤에만 `POST /reservation-requests`를 호출합니다.
 
 ### 5. 내 예약
 
@@ -108,13 +108,16 @@ API:
 API:
 
 - `GET /users/me/reservations`
+- `PATCH /reservations/{reservation_uuid}`
 - `DELETE /reservations/{reservation_uuid}`
+- `GET /reservation-requests/{request_uuid}`
 
 표시 규칙:
 
 - 예약 일시는 `예약 일시: 2026-06-06 13:59:08`처럼 표시합니다.
 - `예약 일시(Seoul, KR)`처럼 본문에 장소명을 넣지 않습니다.
 - 방문 시간은 `방문 시간 14:00`처럼 실제 시간만 표시합니다.
+- 수정/취소 버튼을 누르면 즉시 완료로 보이지 말고, 반환된 `request_uuid`로 처리 상태를 조회합니다.
 
 ### 6. 방문 확인증
 
@@ -242,6 +245,15 @@ API:
 - `POST /admin/schedule-dates/{sale_date}/close`
 - `POST /admin/schedule-dates/{sale_date}/reset-reservations`
 
+Vercel Redis 동기화:
+
+- 어드민 화면은 Cloud Run의 `/admin/schedule-dates/{sale_date}/open|close`를 직접 호출하지 말고 Vercel Function을 호출합니다.
+- Vercel Function은 Cloud Run 응답의 `waiting_room_sync`를 읽어 Redis `wr:open:{sale_date}`를 갱신합니다.
+- `desired_open=true`이면 `SET wr:open:{sale_date} 1`을 수행합니다.
+- `delete_key=true`이면 `DEL wr:open:{sale_date}`를 수행합니다.
+- 백엔드 일정 저장은 성공했지만 Redis 갱신이 실패하면 어드민에게 "일정은 저장되었지만 대기실 동기화가 실패했습니다"라고 보여줍니다.
+- 자세한 구현 흐름은 `docs/rev_004.md`를 기준으로 합니다.
+
 구성:
 
 - 판매 날짜
@@ -293,17 +305,7 @@ API:
 - 노쇼 횟수는 예약 건당이 아니라 판매 일자당 1회입니다.
 - 같은 날짜에 여러 상품을 예약하고 오지 않아도 노쇼는 1회만 증가합니다.
 
-### 7. IP 밴 관리
-
-백엔드 IP 기반 차단은 비활성화되었습니다. 신규 프론트엔드에서는 IP 밴 관리 메뉴를 만들지 않습니다.
-
-호환 API:
-
-- `GET /admin/ip-bans`: 빈 배열
-- `POST /admin/ip-bans`: `410 Gone`
-- `DELETE /admin/ip-bans/{ip_address}`: no-op `204`
-
-### 8. 안내문과 예약 동의 메시지 관리
+### 7. 안내문과 예약 동의 메시지 관리
 
 API:
 
@@ -340,3 +342,20 @@ API:
 - `token_type=auto`는 호환용이며, QR 스캔의 기본값으로 쓰지 않습니다.
 - 미래 예약만 있는 경우 백엔드는 `방문 확인 코드는 예약 당일에만 발급됩니다.` 메시지를 반환합니다.
 - 과도한 요청 차단의 1차 방어는 Vercel Rewrites + Vercel KV에서 구현합니다. 백엔드는 IP 기반 차단을 수행하지 않습니다.
+
+## rev_003 프론트엔드 반영 사항
+
+- 예약 오픈 피크 시간에는 Vercel Redis/KV waiting room을 먼저 통과한 고객만 백엔드 예약 접수 API를 호출합니다.
+- 신규 예약 생성은 `POST /reservations` 대신 `POST /reservation-requests`를 사용합니다.
+- 예약 수정은 `PATCH /reservations/{reservation_uuid}`를 호출하되, 응답은 최종 예약 정보가 아니라 `action=update` 예약 변경 요청 상태입니다.
+- 예약 취소는 `DELETE /reservations/{reservation_uuid}`를 호출하되, 응답은 `action=cancel` 예약 변경 요청 상태입니다.
+- Vercel Function 또는 서버 측 API Route가 waiting room 통과 여부를 확인하고, 통과한 요청에만 `X-Reservation-Gateway-Secret` 헤더를 붙여 Cloud Run으로 전달합니다.
+- 브라우저에는 gateway secret을 절대 노출하지 않습니다.
+- 예약 생성/수정 버튼을 누르면 즉시 `idempotency_key`를 생성합니다. 같은 버튼 재시도에는 같은 key를 재사용하고, 고객이 새 시도를 시작하면 새 key를 만듭니다.
+- 예약 취소는 `Idempotency-Key` 헤더에 취소 시도 UUID를 넣습니다.
+- 생성/수정/취소 응답의 `request_uuid`를 저장하고, `GET /reservation-requests/{request_uuid}`를 polling합니다.
+- `pending`, `enqueued`, `processing` 상태에서는 "예약 접수/처리 중", "수정 처리 중", "취소 처리 중"처럼 action에 맞는 화면을 보여줍니다.
+- `success`가 되면 응답의 `reservations`를 내 예약 화면에 반영합니다. 취소 성공 시 `reservations[0].status`는 `cancelled`입니다.
+- `failed` 또는 `enqueue_failed`가 되면 `error_message`를 고객이 이해할 수 있는 문구로 보여주고 polling을 중단합니다.
+- 같은 예약에 대해 수정/취소 요청이 이미 처리 대기 중이면 백엔드는 409를 반환합니다. 프론트는 기존 요청의 처리가 끝난 뒤 다시 시도하라는 안내를 보여줍니다.
+- waiting room 구현 상세와 Vercel Web GUI 작업은 `docs/rev_003.md`를 기준으로 합니다.

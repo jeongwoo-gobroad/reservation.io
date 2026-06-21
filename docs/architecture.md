@@ -138,3 +138,67 @@ sequenceDiagram
 - 영업일 마감은 `business_day_closes.sale_date` unique 제약으로 중복 마감을 막습니다.
 - 프론트엔드 검증은 사용자 편의용이고, 최종 판단은 항상 API와 DB transaction에서 수행합니다.
 
+## rev_003 예약 피크 완충 구조
+
+예약 생성/수정/취소는 피크 시간에 다음 구조를 사용할 수 있습니다.
+
+```mermaid
+sequenceDiagram
+    participant User as "고객 브라우저"
+    participant Vercel as "Vercel Function + Redis waiting room"
+    participant Api as "Cloud Run API"
+    participant Tasks as "Cloud Tasks"
+    participant Worker as "Cloud Run worker endpoint"
+    participant Db as "Cloud SQL"
+
+    User->>Vercel: 예약 생성/수정/취소 버튼 클릭
+    Vercel->>Vercel: Redis에서 입장 허용 여부 확인
+    alt 입장 대기
+        Vercel-->>User: 대기 상태와 재시도 안내
+    else 입장 허용
+        Vercel->>Api: 예약 변경 API 호출
+        Api->>Db: reservation_requests pending 생성
+        Api->>Tasks: request_uuid task 등록
+        Api-->>Vercel: request_uuid 반환
+        Vercel-->>User: 예약 변경 처리 중
+        Tasks->>Worker: POST /internal/reservation-worker
+        Worker->>Db: request row lock
+        Worker->>Db: 재고/시간대/예약 제한/대상 예약 상태 검증
+        Worker->>Db: reservation 생성/수정/취소 및 request success/failed 저장
+        User->>Api: GET /reservation-requests/{request_uuid}
+        Api-->>User: success/failed 결과
+    end
+```
+
+역할 분리:
+
+- Vercel Redis waiting room은 Cloud Run과 Cloud SQL에 동시에 들어오는 요청 수를 줄입니다.
+- Cloud Tasks는 접수된 예약 변경 요청을 정해진 속도로 worker에 전달합니다.
+- Cloud SQL transaction은 최종 재고, 시간대 정원, 중복 예약 정합성을 보장합니다.
+- Cloud Tasks는 재시도될 수 있으므로 worker는 `reservation_requests.uuid`와 상태값으로 멱등성을 보장합니다.
+
+## rev_004 판매 일자 오픈/마감 동기화
+
+판매 일자 오픈/마감 시 Vercel Redis waiting room 상태는 Vercel Function이 동기화합니다. Cloud Run은 Redis를 직접 호출하지 않고, 응답에 `waiting_room_sync` 지시만 포함합니다.
+
+```mermaid
+sequenceDiagram
+    participant Admin as "관리자 화면"
+    participant Vercel as "Vercel Function"
+    participant Api as "Cloud Run Admin API"
+    participant Db as "Cloud SQL"
+    participant Redis as "Vercel Redis/KV"
+
+    Admin->>Vercel: 특정 판매 일자 오픈/마감
+    Vercel->>Api: POST /admin/schedule-dates/{sale_date}/open 또는 close
+    Api->>Db: schedule_sets.reservation_open 갱신
+    Api-->>Vercel: schedules + waiting_room_sync 반환
+    alt waiting_room_sync.desired_open
+        Vercel->>Redis: SET wr:open:{sale_date} 1
+    else waiting_room_sync.delete_key
+        Vercel->>Redis: DEL wr:open:{sale_date}
+    end
+    Vercel-->>Admin: 백엔드 저장 및 Redis 동기화 결과 표시
+```
+
+이 구조에서는 SQL의 일정 오픈/마감 상태가 원본이고, Redis `wr:open:{sale_date}`는 피크 시간 부하를 줄이기 위한 캐시성 운영 스위치입니다.

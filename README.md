@@ -16,6 +16,8 @@
 - `docs/vercel-manual.md`: Vercel 프론트엔드 배포 매뉴얼
 - `docs/admin-manual.md`: 비전문가용 관리자 매뉴얼
 - `docs/architecture.md`: 서비스 아키텍처
+- `docs/rev_003.md`: Vercel Redis waiting room + Cloud Tasks 예약 접수 구조
+- `docs/rev_004.md`: 판매 일자 오픈/마감과 Vercel Redis waiting room 동기화
 
 ## FastAPI 확인
 
@@ -57,11 +59,12 @@ Cloud Run 운영 DB에는 Cloud Run Job `reservation-api-migrate`로 Alembic을 
 
 - 카카오 로그인 식별값 기반 사용자 생성
 - 관리자 Secret 기반 로그인
-- 관리자 로그인 실패 IP 자동 밴
+- 관리자 로그인은 Secret 기반 ID/PW 인증만 수행하며, IP 기반 자동 밴은 백엔드에서 수행하지 않음
 - 판매 일정, 상품 그룹, 상품 재고, 방문 시간대 정원 관리
 - 같은 날짜 내 복수 일정 예약
 - 일정별 “같은 일자 내 다른 일정과 함께 예약 가능” 정책
 - 예약 생성 시 DB transaction/row lock 기반 동시성 방어
+- 피크 시간 예약 접수를 위한 `reservation_requests` pending 처리와 Cloud Tasks worker 구조
 - TOTP 기반 방문 확인 QR/수동 코드
 - 방문 완료와 최근 확인 내역
 - 영업일 수동 마감

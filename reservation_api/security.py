@@ -7,7 +7,7 @@ import time
 from hashlib import sha256
 from typing import Any
 
-from fastapi import Depends, Header, HTTPException, Request, status
+from fastapi import Depends, Header, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -50,12 +50,6 @@ def verify_access_token(token: str, settings: Settings) -> dict[str, Any]:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="expired token")
     return payload
 
-
-def client_ip(request: Request) -> str:
-    forwarded_for = request.headers.get("x-forwarded-for")
-    if forwarded_for:
-        return forwarded_for.split(",", 1)[0].strip()
-    return request.client.host if request.client else "unknown"
 
 def bearer_token(authorization: str | None = Header(None)) -> str:
     if not authorization or not authorization.lower().startswith("bearer "):
