@@ -272,6 +272,33 @@ def waiting_room_sync_payload(sale_date: date, desired_open: bool, event: str, s
     )
 
 
+def delete_schedule_dependents(db: Session, schedule_set: models.ScheduleSet) -> None:
+    reservations = db.scalars(
+        select(models.Reservation)
+        .where(models.Reservation.schedule_set_id == schedule_set.id)
+        .with_for_update()
+    ).all()
+    reservation_ids = [row.id for row in reservations]
+    reservation_uuids = [row.uuid for row in reservations]
+
+    if reservation_ids or reservation_uuids:
+        visit_filters = []
+        if reservation_ids:
+            visit_filters.append(models.CompletedVisit.reservation_id.in_(reservation_ids))
+        if reservation_uuids:
+            visit_filters.append(models.CompletedVisit.reservation_uuid.in_(reservation_uuids))
+        db.execute(delete(models.CompletedVisit).where(or_(*visit_filters)))
+
+    request_filters = [models.ReservationRequest.payload_json.like(f"%{schedule_set.uuid}%")]
+    if reservation_uuids:
+        request_filters.append(models.ReservationRequest.target_reservation_uuid.in_(reservation_uuids))
+        for reservation_uuid in reservation_uuids:
+            request_filters.append(models.ReservationRequest.result_json.like(f"%{reservation_uuid}%"))
+    db.execute(delete(models.ReservationRequest).where(or_(*request_filters)))
+
+    db.execute(delete(models.Reservation).where(models.Reservation.schedule_set_id == schedule_set.id))
+
+
 @app.post("/admin/login", response_model=TokenResponse, tags=["admin-auth"])
 def admin_login(body: AdminLoginRequest) -> TokenResponse:
     ok = body.admin_id == settings.admin_id and body.password == settings.admin_password
@@ -518,6 +545,7 @@ def patch_schedule_set(
 @app.delete("/admin/schedules/{schedule_set_uuid}", status_code=204, tags=["admin-schedules"])
 def delete_schedule_set(schedule_set_uuid: str, _: Annotated[dict, Depends(require_admin)], db: Session = Depends(get_db)) -> None:
     schedule_set = require_schedule_set(db, schedule_set_uuid)
+    delete_schedule_dependents(db, schedule_set)
     db.delete(schedule_set)
     db.commit()
 

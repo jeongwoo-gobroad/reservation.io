@@ -795,3 +795,10 @@ GET /admin/reservations?sale_date=2026-07-01&nickname=피카
 ```
 
 프론트는 고객명 열에 `customer_name`을 우선 사용하고, 비어 있으면 `nickname`, 그래도 비어 있으면 `-`를 표시합니다.
+# rev_006 일정 삭제 무결성 보강
+
+`DELETE /admin/schedules/{schedule_set_uuid}`는 연결된 방문 확인 기록, 예약 요청 기록, 예약 기록을 먼저 삭제한 뒤 일정, 상품, 방문 시간을 삭제합니다.
+
+프론트 확인창에는 다음 내용을 포함하십시오.
+
+> 이 일정을 삭제하면 연결된 예약과 방문 확인 기록도 함께 삭제되며 복구할 수 없습니다.

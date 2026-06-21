@@ -399,3 +399,10 @@ API:
 
 - `GET /admin/reservations`의 고객명 열은 `customer_name`을 우선 사용합니다.
 - 값이 없으면 `nickname`, 그래도 없으면 `-`를 표시합니다.
+# rev_006 일정 삭제 확인창
+
+관리자 일정 삭제 버튼을 누르면 다음 내용을 확인창에 표시합니다.
+
+> 이 일정을 삭제하면 연결된 예약과 방문 확인 기록도 함께 삭제되며 복구할 수 없습니다.
+
+API 경로는 그대로 `DELETE /admin/schedules/{schedule_set_uuid}`입니다.
