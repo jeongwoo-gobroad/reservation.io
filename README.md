@@ -78,3 +78,4 @@ Cloud Run 운영 DB에는 Cloud Run Job `reservation-api-migrate`로 Alembic을 
 GCP 웹 콘솔 중심 절차는 `docs/gcp-cloudrun-manual.md`를 참고하십시오.
 
 프론트엔드 Vercel 배포는 `docs/vercel-manual.md`를 참고하십시오.
+> 최신 변경 문서: `docs/rev_005.md`에는 개인정보 관리, 개인정보 처리방침, 관리자 예약 현황 고객명, 이용자 재고/인원 숫자 숨김, 지난 일정 조회 API가 정리되어 있습니다.

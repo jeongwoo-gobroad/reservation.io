@@ -70,6 +70,8 @@ class ScheduleSetCreate(BaseModel):
     can_bundle: bool = Field(True, description="같은 판매 일자 안의 다른 판매 일정과 함께 예약 가능한지 여부")
     has_time_slots: bool = True
     reservation_open: bool = False
+    show_stock_remaining: bool = Field(True, description="이용자 화면에 남은 재고 수를 표시할지 여부")
+    show_time_slot_remaining: bool = Field(True, description="이용자 화면에 방문 시간별 남은 인원을 표시할지 여부")
     time_slots: list[TimeSlotIn] = Field(default_factory=list)
     groups: list[ProductGroupIn]
 
@@ -78,6 +80,8 @@ class ScheduleSetPatch(BaseModel):
     title: str | None = None
     can_bundle: bool | None = None
     reservation_open: bool | None = None
+    show_stock_remaining: bool | None = None
+    show_time_slot_remaining: bool | None = None
 
 
 class TimeSlotOut(BaseModel):
@@ -106,8 +110,18 @@ class ScheduleSetOut(BaseModel):
     can_bundle: bool
     has_time_slots: bool
     reservation_open: bool
+    show_stock_remaining: bool
+    show_time_slot_remaining: bool
     products: list[ProductOut]
     time_slots: list[TimeSlotOut]
+
+
+class ScheduleSetPageOut(BaseModel):
+    items: list[ScheduleSetOut]
+    total: int
+    offset: int
+    limit: int
+    has_more: bool
 
 
 class WaitingRoomSyncOut(BaseModel):
@@ -168,6 +182,9 @@ class ReservationUpdateRequestCreate(ReservationPatch):
 
 class ReservationOut(BaseModel):
     uuid: str
+    user_uuid: str = ""
+    nickname: str = ""
+    customer_name: str = ""
     sale_date: date
     schedule_set_uuid: str
     schedule_title: str

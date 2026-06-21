@@ -50,6 +50,8 @@ class ScheduleSet(Base):
     can_bundle: Mapped[bool] = mapped_column(Boolean, default=True)
     has_time_slots: Mapped[bool] = mapped_column(Boolean, default=False)
     reservation_open: Mapped[bool] = mapped_column(Boolean, default=False)
+    show_stock_remaining: Mapped[bool] = mapped_column(Boolean, default=True)
+    show_time_slot_remaining: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
 

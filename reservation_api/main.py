@@ -5,11 +5,12 @@ import hmac
 import urllib.parse
 import urllib.request
 from datetime import date
+from pathlib import Path
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -54,6 +55,7 @@ from .schemas import (
     ScheduleDateOperationOut,
     ScheduleSetCreate,
     ScheduleSetOut,
+    ScheduleSetPageOut,
     ScheduleSetPatch,
     SettingOut,
     SettingUpdate,
@@ -73,6 +75,7 @@ from .timezone import local_today
 settings = load_settings()
 message_bus = get_message_bus(settings)
 manual_code_registry = get_manual_code_registry(settings)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 app = FastAPI(
     title="Pokecard Reservation API",
@@ -103,6 +106,14 @@ def create_local_dev_schema() -> None:
 @app.get("/health", tags=["system"])
 def health() -> dict[str, str]:
     return {"status": "ok", "service": settings.service_name, "environment": settings.environment}
+
+
+@app.get("/static/personal.md", tags=["static"])
+def personal_policy_markdown() -> Response:
+    path = PROJECT_ROOT / "static" / "personal.md"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="personal policy not found")
+    return Response(path.read_text(encoding="utf-8"), media_type="text/markdown; charset=utf-8")
 
 
 def require_reservation_gateway(
@@ -333,6 +344,61 @@ def update_nickname(body: NicknameRequest, user: models.User = Depends(require_u
     return user
 
 
+@app.delete("/users/me", status_code=204, tags=["users"])
+def delete_me(user: models.User = Depends(require_user), db: Session = Depends(get_db)) -> None:
+    try:
+        manual_code_registry.delete_user(user.uuid)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="manual visit code cleanup failed") from exc
+
+    db.scalars(
+        select(models.ReservationRequest).where(models.ReservationRequest.user_id == user.id).with_for_update()
+    ).all()
+
+    locked_user = db.scalar(select(models.User).where(models.User.id == user.id).with_for_update())
+    if not locked_user:
+        raise HTTPException(status_code=404, detail="user not found")
+
+    reservations = db.scalars(
+        select(models.Reservation).where(models.Reservation.user_id == locked_user.id).with_for_update()
+    ).all()
+    reservation_uuids = [row.uuid for row in reservations]
+
+    completed_visit_filters = [
+        models.CompletedVisit.user_id == locked_user.id,
+        models.CompletedVisit.user_uuid == locked_user.uuid,
+    ]
+    if reservation_uuids:
+        completed_visit_filters.append(models.CompletedVisit.reservation_uuid.in_(reservation_uuids))
+
+    db.execute(delete(models.CompletedVisit).where(or_(*completed_visit_filters)))
+    db.execute(delete(models.NoShowCount).where(models.NoShowCount.user_id == locked_user.id))
+    db.execute(
+        delete(models.BannedUser).where(
+            or_(
+                models.BannedUser.user_id == locked_user.id,
+                models.BannedUser.user_uuid == locked_user.uuid,
+            )
+        )
+    )
+    db.execute(
+        delete(models.ReservationRequest).where(
+            or_(
+                models.ReservationRequest.user_id == locked_user.id,
+                models.ReservationRequest.user_uuid == locked_user.uuid,
+            )
+        )
+    )
+    db.execute(delete(models.Reservation).where(models.Reservation.user_id == locked_user.id))
+    db.delete(locked_user)
+    db.commit()
+
+    try:
+        manual_code_registry.delete_user(user.uuid)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="manual visit code cleanup failed") from exc
+
+
 @app.get("/schedules/open", response_model=list[ScheduleSetOut], tags=["schedules"])
 def public_open_schedules(db: Session = Depends(get_db)) -> list[ScheduleSetOut]:
     rows = db.scalars(
@@ -341,7 +407,7 @@ def public_open_schedules(db: Session = Depends(get_db)) -> list[ScheduleSetOut]
         .options(selectinload(models.ScheduleSet.products).selectinload(models.SaleProduct.group), selectinload(models.ScheduleSet.time_slots))
         .order_by(models.ScheduleSet.sale_date, models.ScheduleSet.title)
     ).all()
-    return [schedule_out(db, row, include_remaining=True) for row in rows]
+    return [schedule_out(db, row, include_remaining=True, respect_visibility=True) for row in rows]
 
 
 @app.get("/admin/schedules", response_model=list[ScheduleSetOut], tags=["admin-schedules"])
@@ -351,10 +417,37 @@ def admin_list_schedules(
 ) -> list[ScheduleSetOut]:
     rows = db.scalars(
         select(models.ScheduleSet)
+        .where(models.ScheduleSet.sale_date >= local_today(settings))
         .options(selectinload(models.ScheduleSet.products).selectinload(models.SaleProduct.group), selectinload(models.ScheduleSet.time_slots))
         .order_by(models.ScheduleSet.sale_date, models.ScheduleSet.title)
     ).all()
-    return [schedule_out(db, row, include_remaining=True) for row in rows]
+    return [schedule_out(db, row, include_remaining=True, respect_visibility=False) for row in rows]
+
+
+@app.get("/admin/schedules/past", response_model=ScheduleSetPageOut, tags=["admin-schedules"])
+def admin_list_past_schedules(
+    _: Annotated[dict, Depends(require_admin)],
+    db: Session = Depends(get_db),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+) -> ScheduleSetPageOut:
+    today = local_today(settings)
+    total = int(db.scalar(select(func.count(models.ScheduleSet.id)).where(models.ScheduleSet.sale_date < today)) or 0)
+    rows = db.scalars(
+        select(models.ScheduleSet)
+        .where(models.ScheduleSet.sale_date < today)
+        .options(selectinload(models.ScheduleSet.products).selectinload(models.SaleProduct.group), selectinload(models.ScheduleSet.time_slots))
+        .order_by(models.ScheduleSet.sale_date.desc(), models.ScheduleSet.title)
+        .offset(offset)
+        .limit(limit)
+    ).all()
+    return ScheduleSetPageOut(
+        items=[schedule_out(db, row, include_remaining=True, respect_visibility=False) for row in rows],
+        total=total,
+        offset=offset,
+        limit=limit,
+        has_more=offset + len(rows) < total,
+    )
 
 
 @app.post("/admin/schedules", response_model=ScheduleSetOut, status_code=201, tags=["admin-schedules"])
@@ -369,6 +462,8 @@ def create_schedule_set(
         can_bundle=body.can_bundle,
         has_time_slots=body.has_time_slots,
         reservation_open=body.reservation_open,
+        show_stock_remaining=body.show_stock_remaining,
+        show_time_slot_remaining=body.show_time_slot_remaining,
     )
     db.add(schedule_set)
     db.flush()
@@ -394,7 +489,7 @@ def create_schedule_set(
             )
     db.commit()
     db.refresh(schedule_set)
-    return schedule_out(db, schedule_set, include_remaining=True)
+    return schedule_out(db, schedule_set, include_remaining=True, respect_visibility=False)
 
 
 @app.patch("/admin/schedules/{schedule_set_uuid}", response_model=ScheduleSetOut, tags=["admin-schedules"])
@@ -411,9 +506,13 @@ def patch_schedule_set(
         schedule_set.can_bundle = body.can_bundle
     if body.reservation_open is not None:
         schedule_set.reservation_open = body.reservation_open
+    if body.show_stock_remaining is not None:
+        schedule_set.show_stock_remaining = body.show_stock_remaining
+    if body.show_time_slot_remaining is not None:
+        schedule_set.show_time_slot_remaining = body.show_time_slot_remaining
     db.commit()
     db.refresh(schedule_set)
-    return schedule_out(db, schedule_set, include_remaining=True)
+    return schedule_out(db, schedule_set, include_remaining=True, respect_visibility=False)
 
 
 @app.delete("/admin/schedules/{schedule_set_uuid}", status_code=204, tags=["admin-schedules"])
@@ -429,7 +528,7 @@ def open_schedule_date(sale_date: date, _: Annotated[dict, Depends(require_admin
     for row in rows:
         row.reservation_open = True
     db.commit()
-    schedules = [schedule_out(db, row, include_remaining=True) for row in rows]
+    schedules = [schedule_out(db, row, include_remaining=True, respect_visibility=False) for row in rows]
     return ScheduleDateOperationOut(
         sale_date=sale_date,
         schedules=schedules,
@@ -448,7 +547,7 @@ def close_schedule_date(sale_date: date, _: Annotated[dict, Depends(require_admi
     for row in rows:
         row.reservation_open = False
     db.commit()
-    schedules = [schedule_out(db, row, include_remaining=True) for row in rows]
+    schedules = [schedule_out(db, row, include_remaining=True, respect_visibility=False) for row in rows]
     return ScheduleDateOperationOut(
         sale_date=sale_date,
         schedules=schedules,
@@ -563,7 +662,7 @@ def my_reservations(user: models.User = Depends(require_user), db: Session = Dep
     rows = db.scalars(
         select(models.Reservation)
         .where(models.Reservation.user_id == user.id, models.Reservation.status == "reserved")
-        .options(selectinload(models.Reservation.product), selectinload(models.Reservation.schedule_set), selectinload(models.Reservation.time_slot))
+        .options(selectinload(models.Reservation.user), selectinload(models.Reservation.product), selectinload(models.Reservation.schedule_set), selectinload(models.Reservation.time_slot))
         .order_by(models.Reservation.sale_date, models.Reservation.reserved_at)
     ).all()
     return [reservation_out(row) for row in rows]

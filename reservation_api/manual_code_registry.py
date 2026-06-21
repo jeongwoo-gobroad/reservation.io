@@ -38,6 +38,9 @@ class ManualCodeRegistry(Protocol):
     def resolve(self, code: str) -> ManualCodeResolution | None:
         ...
 
+    def delete_user(self, user_uuid: str) -> None:
+        ...
+
 
 def counter_expires_at(counter: int, settings: Settings) -> datetime:
     expires_epoch = (counter + settings.otp_delta + 1) * settings.otp_timeout_second
@@ -55,6 +58,9 @@ class DisabledManualCodeRegistry:
         )
 
     def resolve(self, code: str) -> ManualCodeResolution | None:
+        return None
+
+    def delete_user(self, user_uuid: str) -> None:
         return None
 
 
@@ -94,6 +100,12 @@ class MemoryManualCodeRegistry:
                 nonce=payload["nonce"],
                 expires_at=payload["expires_at"],
             )
+
+    def delete_user(self, user_uuid: str) -> None:
+        with self._lock:
+            matching_codes = [code for code, payload in self._codes.items() if payload.get("user_uuid") == user_uuid]
+            for code in matching_codes:
+                self._codes.pop(code, None)
 
     def _delete_expired(self, now: datetime) -> None:
         expired = [code for code, payload in self._codes.items() if payload["expires_at"] <= now]
@@ -199,6 +211,20 @@ class FirestoreManualCodeRegistry:
             nonce=int(data.get("nonce", 0)),
             expires_at=expires_at,
         )
+
+    def delete_user(self, user_uuid: str) -> None:
+        docs = self._collection.where("user_uuid", "==", user_uuid).stream()
+        batch = self._client.batch()
+        pending = 0
+        for snapshot in docs:
+            batch.delete(snapshot.reference)
+            pending += 1
+            if pending >= 400:
+                batch.commit()
+                batch = self._client.batch()
+                pending = 0
+        if pending:
+            batch.commit()
 
 
 def get_manual_code_registry(settings: Settings) -> ManualCodeRegistry:

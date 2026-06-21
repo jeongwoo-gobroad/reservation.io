@@ -359,3 +359,43 @@ API:
 - `failed` 또는 `enqueue_failed`가 되면 `error_message`를 고객이 이해할 수 있는 문구로 보여주고 polling을 중단합니다.
 - 같은 예약에 대해 수정/취소 요청이 이미 처리 대기 중이면 백엔드는 409를 반환합니다. 프론트는 기존 요청의 처리가 끝난 뒤 다시 시도하라는 안내를 보여줍니다.
 - waiting room 구현 상세와 Vercel Web GUI 작업은 `docs/rev_003.md`를 기준으로 합니다.
+# rev_005 프론트엔드 반영 사항
+
+## 이용자 개인정보 관리 페이지
+
+- 상단바 또는 마이페이지에 “내 정보” 진입점을 둡니다.
+- `GET /users/me`로 현재 닉네임을 표시합니다.
+- `PATCH /users/me/nickname`으로 닉네임을 변경합니다.
+- `DELETE /users/me`로 회원 탈퇴를 처리합니다.
+- 회원 탈퇴 전에는 “계정, 예약, 방문 확인, 노쇼, 예약 제한 기록이 삭제되며 복구할 수 없습니다” 확인 창을 반드시 보여줍니다.
+- 탈퇴 성공 후 사용자 토큰을 삭제하고 로그인 화면으로 이동합니다.
+
+## 개인정보 처리방침 페이지
+
+- `/static/personal.md`를 fetch하여 Markdown으로 렌더링합니다.
+- 로그인 전에도 접근 가능하게 둡니다.
+- 로그인 화면, 푸터, 내 정보 화면에서 접근할 수 있게 합니다.
+
+## 일정 화면 숫자 숨김
+
+- `GET /schedules/open`에서 `stock_quantity`, `stock_remaining`, `capacity`, `remaining_customers`가 `null`이면 해당 숫자 영역을 숨깁니다.
+- 숫자가 숨겨졌을 때 `0`이나 `-1`처럼 표시하지 않습니다.
+- 예약 가능 여부는 예약 요청 결과로 안내합니다.
+
+관리자 일정 생성/수정 화면 문구:
+
+- “남은 재고 숫자를 손님에게 보여주기”
+- “방문 시간별 남은 자리 수를 손님에게 보여주기”
+
+관리자 화면에는 `show_stock_remaining`, `show_time_slot_remaining`, `null`, `capacity` 같은 기술 단어를 노출하지 않습니다.
+
+## 지난 일정 조회
+
+- 일정 관리 기본 화면은 `GET /admin/schedules`를 사용하고 오늘 이후 일정만 보여줍니다.
+- 지난 일정은 별도 탭 또는 페이지에서 `GET /admin/schedules/past?offset=0&limit=20`으로 조회합니다.
+- `has_more=true`이면 “더 보기” 버튼을 보여줍니다.
+
+## 예약 현황 고객명
+
+- `GET /admin/reservations`의 고객명 열은 `customer_name`을 우선 사용합니다.
+- 값이 없으면 `nickname`, 그래도 없으면 `-`를 표시합니다.

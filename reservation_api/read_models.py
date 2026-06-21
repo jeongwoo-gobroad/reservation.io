@@ -9,7 +9,16 @@ from . import models
 from .schemas import CompletedVisitOut, PendingDayCloseOut, ReservationOut, ReservationRequestOut, ScheduleSetOut
 
 
-def schedule_out(db: Session, row: models.ScheduleSet, include_remaining: bool = False) -> ScheduleSetOut:
+def schedule_out(
+    db: Session,
+    row: models.ScheduleSet,
+    include_remaining: bool = False,
+    respect_visibility: bool = True,
+) -> ScheduleSetOut:
+    show_stock_remaining = getattr(row, "show_stock_remaining", True)
+    show_time_slot_remaining = getattr(row, "show_time_slot_remaining", True)
+    include_stock_remaining = include_remaining and (show_stock_remaining or not respect_visibility)
+    include_time_slot_remaining = include_remaining and (show_time_slot_remaining or not respect_visibility)
     return ScheduleSetOut(
         uuid=row.uuid,
         sale_date=row.sale_date,
@@ -17,6 +26,8 @@ def schedule_out(db: Session, row: models.ScheduleSet, include_remaining: bool =
         can_bundle=row.can_bundle,
         has_time_slots=row.has_time_slots,
         reservation_open=row.reservation_open,
+        show_stock_remaining=show_stock_remaining,
+        show_time_slot_remaining=show_time_slot_remaining,
         products=[
             {
                 "uuid": product.uuid,
@@ -24,8 +35,8 @@ def schedule_out(db: Session, row: models.ScheduleSet, include_remaining: bool =
                 "group_name": product.group.name,
                 "group_purchase_limit": product.group.purchase_limit,
                 "name": product.name,
-                "stock_quantity": product.stock_quantity,
-                "stock_remaining": stock_remaining(db, product) if include_remaining else None,
+                "stock_quantity": product.stock_quantity if show_stock_remaining or not respect_visibility else None,
+                "stock_remaining": stock_remaining(db, product) if include_stock_remaining else None,
                 "per_user_limit": product.per_user_limit,
             }
             for product in row.products
@@ -35,8 +46,8 @@ def schedule_out(db: Session, row: models.ScheduleSet, include_remaining: bool =
                 "uuid": slot.uuid,
                 "code": slot.code,
                 "label": slot.label,
-                "capacity": slot.capacity,
-                "remaining_customers": time_slot_remaining(db, slot) if include_remaining else None,
+                "capacity": slot.capacity if show_time_slot_remaining or not respect_visibility else None,
+                "remaining_customers": time_slot_remaining(db, slot) if include_time_slot_remaining else None,
             }
             for slot in sorted(row.time_slots, key=lambda item: item.code)
         ],
@@ -44,8 +55,14 @@ def schedule_out(db: Session, row: models.ScheduleSet, include_remaining: bool =
 
 
 def reservation_out(row: models.Reservation) -> ReservationOut:
+    user = getattr(row, "user", None)
+    nickname = user.nickname if user else ""
+    user_uuid = user.uuid if user else ""
     return ReservationOut(
         uuid=row.uuid,
+        user_uuid=user_uuid,
+        nickname=nickname,
+        customer_name=nickname,
         sale_date=row.sale_date,
         schedule_set_uuid=row.schedule_set.uuid,
         schedule_title=row.schedule_set.title,
@@ -67,6 +84,7 @@ def reservation_request_out(db: Session, row: models.ReservationRequest) -> Rese
             select(models.Reservation)
             .where(models.Reservation.uuid.in_(reservation_uuids))
             .options(
+                selectinload(models.Reservation.user),
                 selectinload(models.Reservation.product),
                 selectinload(models.Reservation.schedule_set),
                 selectinload(models.Reservation.time_slot),

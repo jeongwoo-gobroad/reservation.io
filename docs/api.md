@@ -710,3 +710,88 @@ GET /admin/reservations?sale_date=2026-07-01&nickname=피카
 
 - `disclaimer_markdown`
 - `reservation_agreement_markdown`
+# rev_005 추가/변경 API
+
+이번 변경은 개인정보 관리, 개인정보 처리방침, 고객명 누락 수정, 이용자 재고/인원 표시 숨김, 지난 일정 페이지 조회를 포함합니다.
+
+## GET `/static/personal.md`
+
+개인정보 처리방침 마크다운 원문을 반환합니다.
+
+- 인증: 불필요
+- 응답 Content-Type: `text/markdown`
+- 프론트는 이 값을 Markdown 렌더러로 표시합니다.
+
+## DELETE `/users/me`
+
+현재 로그인한 이용자의 계정과 개인 연결 기록을 삭제합니다.
+
+- 인증: 이용자 Bearer token 필요
+- 성공 응답: `204 No Content`
+- 사용자 계정 행은 삭제됩니다.
+- 예약, 예약 요청, 방문 확인, 노쇼, 예약 제한 기록 중 해당 사용자를 식별할 수 있는 행은 삭제됩니다.
+- 수동 방문 코드 저장소가 memory 또는 Firestore이면 해당 사용자의 남은 수동 코드도 삭제됩니다.
+- 삭제 후 해당 사용자의 관리자 예약 현황, 최근 방문 확인 내역, 노쇼/예약 제한 기록은 더 이상 조회되지 않습니다.
+- 탈퇴 후 기존 토큰으로 `/users/me` 등을 호출하면 401을 반환합니다.
+
+## GET `/schedules/open`
+
+이용자에게 보이는 예약 가능 일정은 오늘 이후이고, 예약 열림 상태인 일정만 반환합니다.
+
+일정 생성 시 관리자가 숫자 표시를 숨긴 경우:
+
+- `show_stock_remaining=false`이면 `products[].stock_quantity`와 `products[].stock_remaining`은 `null`입니다.
+- `show_time_slot_remaining=false`이면 `time_slots[].capacity`와 `time_slots[].remaining_customers`는 `null`입니다.
+- 예약 가능 여부와 재고/정원 검증은 숨김 여부와 관계없이 worker에서 최종 판단합니다.
+
+## GET `/admin/schedules`
+
+관리자 기본 일정 목록입니다. 오늘 이후의 일정만 반환합니다. 지난 일정은 `/admin/schedules/past`를 사용합니다.
+
+## GET `/admin/schedules/past`
+
+지난 판매 일정을 페이지 단위로 조회합니다.
+
+- `offset`: 기본 0
+- `limit`: 기본 20, 최소 1, 최대 100
+
+응답:
+
+```json
+{
+  "items": [],
+  "total": 42,
+  "offset": 0,
+  "limit": 20,
+  "has_more": true
+}
+```
+
+## POST/PATCH `/admin/schedules`
+
+일정 생성과 수정 요청에 다음 필드가 추가되었습니다.
+
+```json
+{
+  "show_stock_remaining": true,
+  "show_time_slot_remaining": true
+}
+```
+
+- `show_stock_remaining=false`: 이용자 화면에 재고 관련 숫자를 숨깁니다.
+- `show_time_slot_remaining=false`: 이용자 화면에 방문 시간별 인원 숫자를 숨깁니다.
+- 관리자 API 응답은 항상 실제 숫자를 볼 수 있습니다.
+
+## GET `/admin/reservations`
+
+예약 응답에 고객 식별 표시용 필드가 추가되었습니다.
+
+```json
+{
+  "user_uuid": "user-uuid",
+  "nickname": "피카츄트레이너",
+  "customer_name": "피카츄트레이너"
+}
+```
+
+프론트는 고객명 열에 `customer_name`을 우선 사용하고, 비어 있으면 `nickname`, 그래도 비어 있으면 `-`를 표시합니다.
