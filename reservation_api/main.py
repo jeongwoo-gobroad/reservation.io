@@ -73,6 +73,34 @@ from .timezone import local_today
 
 
 settings = load_settings()
+
+
+def validate_runtime_settings() -> None:
+    if settings.environment.strip().lower() not in {"prod", "production"}:
+        return
+
+    errors: list[str] = []
+    weak_secret_values = {"", "dev-secret-change-me", "change-this-to-a-long-random-string"}
+    weak_otp_secret_values = {"", "dev-secret-change-me", "change-this-to-a-long-random-string", "change-this-to-another-long-random-string"}
+
+    if settings.secret_key in weak_secret_values:
+        errors.append("SECRET_KEY must be set to a strong random value")
+    if settings.otp_secret_key in weak_otp_secret_values:
+        errors.append("OTP_SECRET_KEY must be set to a strong random value")
+    if settings.admin_id == "admin" or settings.admin_password in {"", "admin", "change-this-password"}:
+        errors.append("ADMIN_ID and ADMIN_PASSWORD must not use development defaults")
+    if not settings.reservation_gateway_secret:
+        errors.append("RESERVATION_GATEWAY_SECRET is required in production")
+    if settings.reservation_queue_backend == "cloud_tasks" and not settings.reservation_worker_secret:
+        errors.append("RESERVATION_WORKER_SECRET is required when Cloud Tasks worker mode is enabled")
+    if not settings.kakao_redirect_uri_allowlist:
+        errors.append("KAKAO_REDIRECT_URI_ALLOWLIST should list every allowed Kakao callback URL in production")
+
+    if errors:
+        raise RuntimeError("Invalid production configuration: " + "; ".join(errors))
+
+
+validate_runtime_settings()
 message_bus = get_message_bus(settings)
 manual_code_registry = get_manual_code_registry(settings)
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -116,20 +144,35 @@ def personal_policy_markdown() -> Response:
     return Response(path.read_text(encoding="utf-8"), media_type="text/markdown; charset=utf-8")
 
 
-def require_reservation_gateway(
-    x_reservation_gateway_secret: str | None = Header(None, alias="X-Reservation-Gateway-Secret"),
-) -> None:
-    if settings.reservation_gateway_secret and not hmac.compare_digest(
+def constant_time_equal(left: str, right: str) -> bool:
+    return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
+
+
+def verify_reservation_gateway_header(x_reservation_gateway_secret: str | None) -> None:
+    if settings.reservation_gateway_secret and not constant_time_equal(
         x_reservation_gateway_secret or "",
         settings.reservation_gateway_secret,
     ):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="reservation gateway required")
 
 
+def require_reservation_gateway(
+    x_reservation_gateway_secret: str | None = Header(None, alias="X-Reservation-Gateway-Secret"),
+) -> None:
+    verify_reservation_gateway_header(x_reservation_gateway_secret)
+
+
+def require_admin_login_gateway(
+    x_reservation_gateway_secret: str | None = Header(None, alias="X-Reservation-Gateway-Secret"),
+) -> None:
+    if settings.admin_login_gateway_required:
+        verify_reservation_gateway_header(x_reservation_gateway_secret)
+
+
 def require_reservation_worker(
     x_reservation_worker_secret: str | None = Header(None, alias="X-Reservation-Worker-Secret"),
 ) -> None:
-    if settings.reservation_worker_secret and not hmac.compare_digest(
+    if settings.reservation_worker_secret and not constant_time_equal(
         x_reservation_worker_secret or "",
         settings.reservation_worker_secret,
     ):
@@ -300,8 +343,14 @@ def delete_schedule_dependents(db: Session, schedule_set: models.ScheduleSet) ->
 
 
 @app.post("/admin/login", response_model=TokenResponse, tags=["admin-auth"])
-def admin_login(body: AdminLoginRequest) -> TokenResponse:
-    ok = body.admin_id == settings.admin_id and body.password == settings.admin_password
+def admin_login(
+    body: AdminLoginRequest,
+    _: Annotated[None, Depends(require_admin_login_gateway)],
+) -> TokenResponse:
+    ok = constant_time_equal(body.admin_id, settings.admin_id) and constant_time_equal(
+        body.password,
+        settings.admin_password,
+    )
     if not ok:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid admin credentials")
 
@@ -312,6 +361,8 @@ def admin_login(body: AdminLoginRequest) -> TokenResponse:
 def kakao_exchange(body: KakaoCodeExchangeRequest, db: Session = Depends(get_db)) -> UserTokenResponse:
     if not settings.kakao_rest_api_key:
         raise HTTPException(status_code=500, detail="KAKAO_REST_API_KEY is not configured")
+    if settings.kakao_redirect_uri_allowlist and body.redirect_uri not in settings.kakao_redirect_uri_allowlist:
+        raise HTTPException(status_code=400, detail="redirect_uri is not allowed")
     token_payload = {
         "grant_type": "authorization_code",
         "client_id": settings.kakao_rest_api_key,
@@ -364,27 +415,30 @@ def get_me(user: models.User = Depends(require_user)) -> models.User:
 
 @app.patch("/users/me/nickname", response_model=UserOut, tags=["users"])
 def update_nickname(body: NicknameRequest, user: models.User = Depends(require_user), db: Session = Depends(get_db)) -> models.User:
-    user.nickname = body.nickname.strip()
-    db.add(user)
+    locked_user = db.scalar(select(models.User).where(models.User.id == user.id).with_for_update())
+    if not locked_user:
+        raise HTTPException(status_code=404, detail="user not found")
+    locked_user.nickname = body.nickname.strip()
+    db.add(locked_user)
     db.commit()
-    db.refresh(user)
-    return user
+    db.refresh(locked_user)
+    return locked_user
 
 
 @app.delete("/users/me", status_code=204, tags=["users"])
 def delete_me(user: models.User = Depends(require_user), db: Session = Depends(get_db)) -> None:
+    locked_user = db.scalar(select(models.User).where(models.User.id == user.id).with_for_update())
+    if not locked_user:
+        raise HTTPException(status_code=404, detail="user not found")
+
     try:
-        manual_code_registry.delete_user(user.uuid)
+        manual_code_registry.delete_user(locked_user.uuid)
     except Exception as exc:
         raise HTTPException(status_code=503, detail="manual visit code cleanup failed") from exc
 
     db.scalars(
-        select(models.ReservationRequest).where(models.ReservationRequest.user_id == user.id).with_for_update()
+        select(models.ReservationRequest).where(models.ReservationRequest.user_id == locked_user.id).with_for_update()
     ).all()
-
-    locked_user = db.scalar(select(models.User).where(models.User.id == user.id).with_for_update())
-    if not locked_user:
-        raise HTTPException(status_code=404, detail="user not found")
 
     reservations = db.scalars(
         select(models.Reservation).where(models.Reservation.user_id == locked_user.id).with_for_update()
@@ -417,13 +471,14 @@ def delete_me(user: models.User = Depends(require_user), db: Session = Depends(g
         )
     )
     db.execute(delete(models.Reservation).where(models.Reservation.user_id == locked_user.id))
+    deleted_user_uuid = locked_user.uuid
     db.delete(locked_user)
     db.commit()
 
     try:
-        manual_code_registry.delete_user(user.uuid)
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail="manual visit code cleanup failed") from exc
+        manual_code_registry.delete_user(deleted_user_uuid)
+    except Exception:
+        pass
 
 
 @app.get("/schedules/open", response_model=list[ScheduleSetOut], tags=["schedules"])
@@ -551,7 +606,12 @@ def delete_schedule_set(schedule_set_uuid: str, _: Annotated[dict, Depends(requi
 
 
 @app.post("/admin/schedule-dates/{sale_date}/open", response_model=ScheduleDateOperationOut, tags=["admin-schedules"])
-def open_schedule_date(sale_date: date, _: Annotated[dict, Depends(require_admin)], db: Session = Depends(get_db)) -> ScheduleDateOperationOut:
+def open_schedule_date(
+    sale_date: date,
+    _: Annotated[dict, Depends(require_admin)],
+    gateway: Annotated[None, Depends(require_reservation_gateway)],
+    db: Session = Depends(get_db),
+) -> ScheduleDateOperationOut:
     rows = db.scalars(select(models.ScheduleSet).where(models.ScheduleSet.sale_date == sale_date)).all()
     for row in rows:
         row.reservation_open = True
@@ -570,7 +630,12 @@ def open_schedule_date(sale_date: date, _: Annotated[dict, Depends(require_admin
 
 
 @app.post("/admin/schedule-dates/{sale_date}/close", response_model=ScheduleDateOperationOut, tags=["admin-schedules"])
-def close_schedule_date(sale_date: date, _: Annotated[dict, Depends(require_admin)], db: Session = Depends(get_db)) -> ScheduleDateOperationOut:
+def close_schedule_date(
+    sale_date: date,
+    _: Annotated[dict, Depends(require_admin)],
+    gateway: Annotated[None, Depends(require_reservation_gateway)],
+    db: Session = Depends(get_db),
+) -> ScheduleDateOperationOut:
     rows = db.scalars(select(models.ScheduleSet).where(models.ScheduleSet.sale_date == sale_date)).all()
     for row in rows:
         row.reservation_open = False
@@ -802,11 +867,14 @@ def issue_my_manual_visit_code(
     db: Session = Depends(get_db),
 ) -> VisitManualCodeOut:
     today = local_today(settings)
+    locked_user = db.scalar(select(models.User).where(models.User.id == user.id).with_for_update())
+    if not locked_user:
+        raise HTTPException(status_code=401, detail="user not found")
     reservation = db.scalar(
         select(models.Reservation)
         .where(
             models.Reservation.uuid == body.reservation_uuid,
-            models.Reservation.user_id == user.id,
+            models.Reservation.user_id == locked_user.id,
         )
         .options(selectinload(models.Reservation.product), selectinload(models.Reservation.schedule_set), selectinload(models.Reservation.time_slot))
     )

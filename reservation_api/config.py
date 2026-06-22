@@ -42,6 +42,7 @@ class Settings:
     kakao_client_secret: str
     kakao_token_url: str
     kakao_userinfo_url: str
+    kakao_redirect_uri_allowlist: list[str]
     otp_secret_key: str
     otp_timeout_second: int
     otp_delta: int
@@ -61,12 +62,14 @@ class Settings:
     reservation_queue_backend: str
     reservation_gateway_secret: str
     reservation_worker_secret: str
+    admin_login_gateway_required: bool
     reservation_worker_url: str
     cloud_tasks_project_id: str
     cloud_tasks_location: str
     cloud_tasks_queue: str
     cloud_tasks_service_account_email: str
     cloud_tasks_audience: str
+    cleanup_gmt9_hour: int
 
 
 @lru_cache(maxsize=1)
@@ -86,6 +89,7 @@ def load_settings() -> Settings:
         kakao_client_secret=os.getenv("KAKAO_CLIENT_SECRET", ""),
         kakao_token_url=os.getenv("KAKAO_TOKEN_URL", "https://kauth.kakao.com/oauth/token"),
         kakao_userinfo_url=os.getenv("KAKAO_USERINFO_URL", "https://kapi.kakao.com/v2/user/me"),
+        kakao_redirect_uri_allowlist=_csv_env("KAKAO_REDIRECT_URI_ALLOWLIST", ""),
         otp_secret_key=os.getenv("OTP_SECRET_KEY", secret_key),
         otp_timeout_second=max(5, _int_env("OTP_TIMEOUT_SECOND", 30)),
         otp_delta=max(0, _int_env("OTP_DELTA", 1)),
@@ -111,10 +115,15 @@ def load_settings() -> Settings:
         ).strip().lower(),
         reservation_gateway_secret=os.getenv("RESERVATION_GATEWAY_SECRET", ""),
         reservation_worker_secret=os.getenv("RESERVATION_WORKER_SECRET", ""),
+        admin_login_gateway_required=_bool_env("ADMIN_LOGIN_GATEWAY_REQUIRED", False),
         reservation_worker_url=os.getenv("RESERVATION_WORKER_URL", ""),
         cloud_tasks_project_id=os.getenv("CLOUD_TASKS_PROJECT_ID", os.getenv("GCP_PROJECT", os.getenv("GOOGLE_CLOUD_PROJECT", ""))),
         cloud_tasks_location=os.getenv("CLOUD_TASKS_LOCATION", os.getenv("REGION", "asia-northeast3")),
         cloud_tasks_queue=os.getenv("CLOUD_TASKS_QUEUE", "reservation-requests"),
         cloud_tasks_service_account_email=os.getenv("CLOUD_TASKS_SERVICE_ACCOUNT_EMAIL", ""),
         cloud_tasks_audience=os.getenv("CLOUD_TASKS_AUDIENCE", ""),
+        cleanup_gmt9_hour=min(
+            23,
+            max(0, _int_env("CLEANUP_GMT+9_HOUR", _int_env("CLEANUP_GMT_PLUS_9_HOUR", 4))),
+        ),
     )

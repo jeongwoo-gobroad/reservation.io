@@ -157,6 +157,7 @@ UX:
 - ID/PW 입력
 - 실패 메시지
 - 로그인 실패는 입력 오류로만 안내합니다. 백엔드는 IP 기반 관리자 차단을 만들지 않습니다.
+- 백엔드에서 `ADMIN_LOGIN_GATEWAY_REQUIRED=true`를 켤 경우, 관리자 로그인도 Vercel 서버 route handler를 통해 호출하고 `X-Reservation-Gateway-Secret`을 붙여야 합니다. 현재 일반 `/api/backend/admin/login` 호출 구조에서는 이 백엔드 옵션을 켜면 안 됩니다.
 
 ### 2. 관리자 메인
 

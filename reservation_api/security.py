@@ -42,11 +42,20 @@ def verify_access_token(token: str, settings: Settings) -> dict[str, Any]:
         encoded, signature = token.split(".", 1)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid token") from exc
-    expected = _b64url(hmac.new(settings.secret_key.encode("utf-8"), encoded.encode("ascii"), sha256).digest())
+    try:
+        expected = _b64url(hmac.new(settings.secret_key.encode("utf-8"), encoded.encode("ascii"), sha256).digest())
+    except UnicodeEncodeError as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid token") from exc
     if not hmac.compare_digest(signature, expected):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid token")
-    payload = json.loads(_unb64url(encoded).decode("utf-8"))
-    if int(payload.get("exp", 0)) < int(time.time()):
+    try:
+        payload = json.loads(_unb64url(encoded).decode("utf-8"))
+        expires_at = int(payload.get("exp", 0))
+    except (TypeError, ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid token") from exc
+    if not isinstance(payload, dict) or not payload.get("sub") or not payload.get("scope"):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid token")
+    if expires_at < int(time.time()):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="expired token")
     return payload
 

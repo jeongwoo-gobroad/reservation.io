@@ -247,6 +247,10 @@ Cloud Run 서비스 화면에서 확인할 곳:
 - `MESSAGE_BUS_BACKEND`
 - `VISIT_EVENT_TOPIC`
 - `CORS_ALLOWED_ORIGINS`
+- `KAKAO_REDIRECT_URI_ALLOWLIST`
+- `ADMIN_LOGIN_GATEWAY_REQUIRED`
+- `CLEANUP_GMT+9_HOUR`
+- `CLEANUP_GMT_PLUS_9_HOUR`
 
 Secret 환경변수:
 
@@ -257,6 +261,8 @@ Secret 환경변수:
 - `ADMIN_PASSWORD`
 - `KAKAO_REST_API_KEY`
 - `KAKAO_CLIENT_SECRET`
+- `RESERVATION_GATEWAY_SECRET`
+- `RESERVATION_WORKER_SECRET`
 
 ## 9. 운영 중 확인할 것
 
@@ -273,6 +279,20 @@ Secret 환경변수:
 
 관리 화면 기준 상세 절차는 [rev_002.md](./rev_002.md)의 `GCP Web GUI 설정 가이드`를 따르십시오.
 - 어드민 메인 화면에서 미마감 지난 영업일을 확인하고 수동 마감해야 함
+
+## 10-1. 예약 요청 cleanup Job
+
+Cloud Build는 `reservation-api-cleanup-reservation-requests` Cloud Run Job을 배포합니다. 이 Job은 24시간 지난 `reservation_requests` 행을 삭제합니다.
+
+매일 실행하려면 Cloud Run Job 화면의 `Triggers` 탭에서 Cloud Scheduler Trigger를 추가해야 합니다.
+
+권장값:
+
+- 스케줄: `0 4 * * *`
+- 시간대: `Asia/Seoul`
+- 의미: 매일 한국 시각 새벽 4시 실행
+
+자세한 GUI 절차는 [rev_007.md](./rev_007.md)를 따르십시오.
 
 ## 11. 자주 생기는 문제
 
@@ -291,6 +311,7 @@ Secret 환경변수:
 ### 카카오 로그인이 실패합니다
 
 - 프론트엔드 callback URL과 카카오 Developers Redirect URI가 정확히 같은지 확인합니다.
+- 백엔드 `_KAKAO_REDIRECT_URI_ALLOWLIST`에도 같은 callback URL이 들어 있는지 확인합니다.
 - 백엔드의 `KAKAO_REST_API_KEY`, `KAKAO_CLIENT_SECRET` Secret 값을 확인합니다.
 
 ### Swagger가 보이지 않습니다
@@ -344,6 +365,8 @@ Google Cloud Console에서 `APIs & Services`로 이동해 아래 API가 활성�
 - `_CLOUD_TASKS_SERVICE_ACCOUNT_EMAIL`: Cloud Tasks가 OIDC 토큰을 붙일 때 사용할 서비스 계정
 - `_RESERVATION_GATEWAY_SECRET_SECRET`: `reservation-gateway-secret`
 - `_RESERVATION_WORKER_SECRET_SECRET`: `reservation-worker-secret`
+- `_KAKAO_REDIRECT_URI_ALLOWLIST`: Vercel 카카오 callback URL
+- `_ADMIN_LOGIN_GATEWAY_REQUIRED`: 현재 프론트가 관리자 로그인용 Vercel Function을 추가하기 전에는 `false`
 
 첫 배포 후 Cloud Run 서비스 URL을 확인하고 `_RESERVATION_WORKER_URL`에는 반드시 `/internal/reservation-worker`까지 붙인 전체 주소를 넣어 주십시오. 값을 비워 두면 요청 host를 기준으로 추정하지만, Vercel Rewrite를 거친 환경에서는 의도하지 않은 주소가 들어갈 수 있습니다.
 

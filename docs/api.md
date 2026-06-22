@@ -10,6 +10,7 @@
 - 백엔드는 IP 기반 차단을 수행하지 않습니다.
 - 반복 요청 차단은 Vercel Rewrites + Vercel KV 같은 프론트 프록시 계층에서 처리합니다.
 - 관리자 로그인 실패는 401만 반환하며, IP 차단 목록에 자동 등록하지 않습니다.
+- 운영 환경에서는 `RESERVATION_GATEWAY_SECRET`, `RESERVATION_WORKER_SECRET`, `KAKAO_REDIRECT_URI_ALLOWLIST` 같은 필수 보안 환경변수가 없으면 앱 시작을 막습니다.
 
 ## 공통 응답
 
@@ -65,12 +66,15 @@
 - 틀린 ID/PW는 401
 - 로그인 실패 횟수로 백엔드 IP 차단을 만들지 않음
 - 프록시 환경에서 IP 기반 차단은 실제 사람 단위가 아닐 수 있으므로 백엔드에서 사용하지 않음
+- `ADMIN_LOGIN_GATEWAY_REQUIRED=true`이면 Vercel Function이 `X-Reservation-Gateway-Secret` 헤더를 붙여 호출해야 합니다. 현재 프론트가 일반 `/api/backend/admin/login` 호출을 쓰는 경우 이 값을 켜기 전에 관리자 로그인용 Vercel Route Handler를 먼저 추가해야 합니다.
 
 ### POST `/auth/kakao/exchange`
 
 프론트엔드가 카카오 OAuth callback에서 받은 `code`와 동일한 `redirect_uri`를 백엔드에 전달합니다.
 
 백엔드는 카카오 token API와 userinfo API를 호출하고, 최소 식별값인 `kakao_id`만 저장합니다.
+
+`KAKAO_REDIRECT_URI_ALLOWLIST`가 설정되어 있으면 요청의 `redirect_uri`는 반드시 허용 목록 중 하나와 정확히 일치해야 합니다.
 
 요청:
 

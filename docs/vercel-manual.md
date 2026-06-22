@@ -21,6 +21,8 @@ WAITING_ROOM_POLL_SECONDS=2
 
 `BACKEND_API_BASE_URL`과 `RESERVATION_GATEWAY_SECRET`은 Vercel Function 서버 코드에서만 사용합니다. 브라우저에 노출되는 `NEXT_PUBLIC_` 값으로 만들지 마십시오.
 
+백엔드의 `ADMIN_LOGIN_GATEWAY_REQUIRED`를 `true`로 바꾸려면 관리자 로그인도 Vercel Function을 거치도록 `/api/admin/login` 같은 서버 route handler를 먼저 구현해야 합니다. 현재처럼 `/api/backend/admin/login` rewrite를 직접 쓰는 프론트에서는 이 값을 `false`로 둡니다.
+
 ## 2. Vercel 프로젝트 생성
 
 1. [Vercel](https://vercel.com)에 로그인합니다.
@@ -63,6 +65,8 @@ https://pokecard-reservation.vercel.app/oauth/kakao/callback
 ```
 
 프론트엔드는 이 callback에서 받은 `code`와 같은 `redirect_uri`를 `POST /auth/kakao/exchange`에 전달해야 합니다.
+
+백엔드 Cloud Build substitution `_KAKAO_REDIRECT_URI_ALLOWLIST`에도 같은 callback URI를 넣어야 합니다. 값이 다르면 백엔드가 400으로 차단합니다.
 
 ## 5. 프론트엔드 필수 화면
 
